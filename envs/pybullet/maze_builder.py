@@ -166,8 +166,8 @@ class MazeBuilder:
         Returns:
             int: 球ID
         """
-        goal_x = goal_pos[1] * self.cell_size + self.cell_size / 2
-        goal_y = goal_pos[0] * self.cell_size + self.cell_size / 2
+        goal_x = goal_pos[0] * self.cell_size + self.cell_size / 2
+        goal_y = goal_pos[1] * self.cell_size + self.cell_size / 2
 
         goal_visual_shape_id = p.createVisualShape(
             shapeType=p.GEOM_SPHERE,
@@ -200,8 +200,8 @@ class MazeBuilder:
             start_pos: 起始位置，(x, y)元组，网格坐标
         """
         if self.robot_id is not None:
-            start_x = start_pos[1] * self.cell_size + self.cell_size / 2
-            start_y = start_pos[0] * self.cell_size + self.cell_size / 2
+            start_x = start_pos[0] * self.cell_size + self.cell_size / 2
+            start_y = start_pos[1] * self.cell_size + self.cell_size / 2
             p.resetBasePositionAndOrientation(
                 self.robot_id,
                 [start_x, start_y, 0.5],  # 确保高度足够

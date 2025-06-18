@@ -142,7 +142,8 @@ def evaluate_sb3(model_path, env_class, curriculum_config, episodes=5, phase=2, 
     # 包装环境以匹配训练时的结构
     env_m = Monitor(env)
     env = DummyVecEnv([lambda: env_m])
-    obs = env.reset()
+    # 在进入epoch之前先reset以确保正常显示球位置
+    env.reset()
     # 如果存在归一化文件，加载它
     if os.path.exists(vec_normalize_path):
         print(f"加载归一化统计数据: {vec_normalize_path}")
@@ -166,9 +167,7 @@ def evaluate_sb3(model_path, env_class, curriculum_config, episodes=5, phase=2, 
             ball_pos = random.choice(random_positions)
 
             print(f"\n===== 评估回合 {episode + 1}/{episodes} =====")
-            # print(f"当前回合设置球位置: {ball_pos}")
 
-            # 获取底层环境
             # 获取最底层环境实例
             inner_env = get_base_env(env)
             print(f"上个回合球的位置：{inner_env.ball_pos}")
