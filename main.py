@@ -2,7 +2,6 @@ import argparse
 import time
 
 from stable_baselines3.common.env_checker import check_env
-from tensorflow.python.keras.saving.utils_v1.mode_keys import is_eval
 
 from config.maze_search.curriculum_config import create_configurable_curriculum
 from config.maze_search.default_config import ENV_CONFIG, TRAIN_CONFIG
@@ -10,7 +9,6 @@ from envs.pybullet.maze_search import MazeEnv, logger
 from evaluation.evaluator import evaluate_sb3
 from training.curriculum import train_with_curriculum
 from training.trainer import train_sb3
-from path_config import PROJECT_ROOT
 
 
 def test_environment(render=True, episodes=10, verbose=False):
@@ -103,7 +101,7 @@ def train_curriculum(render=False, resume=False, phase=None, verbose=False):
     curriculum_config = create_configurable_curriculum()
 
     # 训练
-    results = train_with_curriculum(MazeEnv, curriculum_config, resume=resume, phase_set=phase)
+    results = train_with_curriculum(MazeEnv, curriculum_config, resume=resume, phase_set=phase, verbose=verbose)
 
     # 打印结果
     for phase, complete in results.items():
@@ -125,9 +123,12 @@ def evaluate_model(model_path, episodes=5, phase=3, render=True, verbose=False):
     #                           f'SAC_phase{phase}',
     #                           )
     # 评估模型
+    # 创建课程学习配置
+    curriculum_config = create_configurable_curriculum()
     mean_reward, std_reward = evaluate_sb3(
         model_path=model_path,
         env_class=MazeEnv,
+        curriculum_config=curriculum_config,
         episodes=episodes,
         phase=phase,
         render_mode="human" if render else None,

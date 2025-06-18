@@ -17,18 +17,18 @@ from stable_baselines3 import PPO, SAC, HerReplayBuffer
 from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+from torch.backends.mkl import verbose
 
 from config.maze_search.default_config import MODELS_DIR, LOGS_DIR
 from evaluation.evaluator import evaluate_model
-from training.curriculum_callbacks import CurriculumEvalCallback, SaveLatestModelCallback, \
-    SaveCheckpointCallback, EarlyStoppingException, StepwiseLRSchedulerCallback
+from training.curriculum_callbacks import *
 
 # 创建保存最佳模型的目录
 best_model_dir = os.path.join(MODELS_DIR, f"best_models")
 os.makedirs(best_model_dir, exist_ok=True)
 
 
-def create_env_from_config(env_class, env_config, is_eval=False):
+def create_env_from_config(env_class, env_config, is_eval=False, verbose=False):
     """
     根据配置创建环境
 
@@ -36,62 +36,40 @@ def create_env_from_config(env_class, env_config, is_eval=False):
         env_class: 环境类
         env_config: 环境配置字典
         is_eval: 是否为评估环境
-
+        verbose:
     Returns:
         创建好的环境
+
     """
     # 复制配置以避免修改原始配置
     env_config = deepcopy(env_config)
 
     # 创建基础环境
-    env = env_class(maze_size=env_config.get("maze_size", (7, 7)))
+    # 创建环境时传递完整的env_config
+    env = env_class(
+        maze_size=env_config.get("maze_size", (7, 7)),
+        verbose=verbose,  # 可以根据需要调整
+        env_config=env_config,  # 传递完整配置
+        is_eval=is_eval
+    )
 
     # 设置课程阶段
     env.curriculum_phase = env_config.get("curriculum_phase", 1)
-
-    # 处理随机位置
-    if env_config.get("random_positions", False):
-        # 环境内部随机生成位置
-        pass
-    else:
-        # 设置固定位置
-        if "ball_pos" in env_config:
-            env.ball_pos = env_config["ball_pos"]
-
-        # 处理特殊值
-        if "goal_pos" in env_config:
-            if env_config["goal_pos"] == "ball_pos":
-                env.goal_pos = env.ball_pos
-            else:
-                env.goal_pos = env_config["goal_pos"]
 
     # 包装环境
     env = Monitor(env)  # 返回真实奖励
     env = DummyVecEnv([lambda: env])
 
     # 关键修改：确保训练和评估使用相同的归一化统计数据
-    if is_eval:
-        # 评估环境：使用训练环境的统计数据，但不更新
-        env = VecNormalize(
-            env,
-            norm_obs=True,
-            norm_reward=True,
-            clip_obs=10.,
-            clip_reward=10.,
-            gamma=0.99,
-            training=False  # 评估时不更新统计数据
-        )
-    else:
-        # 训练环境：正常创建
-        env = VecNormalize(
-            env,
-            norm_obs=True,
-            norm_reward=True,
-            clip_obs=10.,
-            clip_reward=10.,
-            gamma=0.99,
-            training=True
-        )
+    env = VecNormalize(
+        env,
+        norm_obs=True,
+        norm_reward=True,
+        clip_obs=10.,
+        clip_reward=10.,
+        gamma=0.99,
+        training=not is_eval  # 评估时不更新统计数据
+    )
 
     return env
 
@@ -155,8 +133,8 @@ def save_training_state(algorithm, phase_complete, phase, timesteps_per_phase, m
         # 获取模型的学习率
         if hasattr(model, "learning_rate"):
             state["learning_rate"] = model.learning_rate
-        elif hasattr(model, "lr_schedule") and callable(model.lr_schedule):
-            state["learning_rate"] = model.lr_schedule(total_steps)
+        # elif hasattr(model, "lr_schedule") and callable(model.lr_schedule):
+        #     state["learning_rate"] = model.lr_schedule(total_steps)
 
         # 获取其他训练参数
         if algorithm == "PPO" and hasattr(model, "clip_range"):
@@ -336,7 +314,334 @@ def load_training_state(algorithm, total_phases):
         }
 
 
-def train_with_curriculum(env_class, curriculum_config, resume=False, phase_set=None):
+def resume_processor(resume, phase, start_phase, total_phases, model, model_params, env, algorithm, phase_set, phase_config):
+    """
+    断点恢复处理
+    :param resume:
+    :param phase:
+    :param start_phase:
+    :param total_phases:
+    :param model:
+    :param model_params:
+    :param env:
+    :param algorithm:
+    :param phase_set:
+    :param phase_config:
+    :return:
+    """
+    state = load_training_state(algorithm, total_phases)
+    if resume and phase == start_phase:
+        # 恢复训练：优先加载保存的训练状态中的模型
+        if "model_path" in state and os.path.exists(f"{state['model_path']}.zip"):
+            print(f"从保存的训练状态加载模型: {state['model_path']}")
+            try:
+                # 使用load方法加载模型，但保留当前阶段的学习率设置
+                model = type(model).load(state["model_path"], env=env)
+
+                # 更新模型的学习率为当前阶段配置的学习率
+                # 更新模型的学习率为当前阶段配置的学习率
+                new_lr = model_params["learning_rate"]
+
+                # 更新模型的学习率为当前阶段配置的学习率
+                if hasattr(model, "learning_rate"):
+                    model.learning_rate = new_lr
+
+                # 2. 更新策略网络(Actor)优化器的学习率
+                if hasattr(model, "policy") and hasattr(model.policy, "optimizer"):
+                    for param_group in model.policy.optimizer.param_groups:
+                        param_group['lr'] = new_lr
+
+                # 3. 如果使用SAC，还需要更新critic优化器的学习率
+                if hasattr(model, "critic") and hasattr(model.critic, "optimizer"):
+                    for param_group in model.critic.optimizer.param_groups:
+                        param_group['lr'] = new_lr
+
+                # 4. 如果有第二个critic网络
+                if hasattr(model, "critic_target") and hasattr(model.critic_target, "optimizer"):
+                    for param_group in model.critic_target.optimizer.param_groups:
+                        param_group['lr'] = new_lr
+
+                # 5. 如果有熵系数优化器
+                if hasattr(model, "ent_coef_optimizer"):
+                    for param_group in model.ent_coef_optimizer.param_groups:
+                        param_group['lr'] = new_lr
+
+                print("模型加载成功")
+
+                # 恢复环境状态（如果有）
+                if "env_state_path" in state and state["env_state_path"] and os.path.exists(
+                        state["env_state_path"]):
+                    try:
+                        from stable_baselines3.common.vec_env import VecNormalize
+                        if isinstance(env, VecNormalize):
+                            env = VecNormalize.load(state["env_state_path"], env)
+                            print(f"已加载环境归一化状态: {state['env_state_path']}")
+                        elif hasattr(env, "load"):
+                            env.load(state["env_state_path"])
+                            print(f"已加载环境状态: {state['env_state_path']}")
+                    except Exception as e:
+                        print(f"加载环境状态失败: {e}")
+
+                # 恢复经验回放池（如果有）
+                if "replay_buffer_path" in state and state["replay_buffer_path"] and os.path.exists(
+                        state["replay_buffer_path"]):
+                    try:
+                        model.load_replay_buffer(state["replay_buffer_path"])
+                        print(f"已加载经验回放池: {state['replay_buffer_path']}")
+                    except Exception as e:
+                        print(f"加载经验回放池失败: {e}")
+            except Exception as e:
+                print(f"从训练状态加载模型失败: {e}，尝试其他模型加载方式")
+                # 如果加载失败，继续尝试其他加载方式
+
+        # 如果没有找到训练状态中的模型或加载失败，则按原来的逻辑尝试加载
+        if not ("model_path" in state and os.path.exists(f"{state['model_path']}.zip")):
+            latest_path = os.path.join(MODELS_DIR, f"{algorithm}_phase{phase}_latest")
+            best_path = os.path.join(MODELS_DIR, f"{algorithm}_phase{phase}_best")
+            phase_path = os.path.join(MODELS_DIR, f"{algorithm}_phase{phase}")
+
+            # 处理强制跳过阶段的情况
+            if phase_set is not None and phase == start_phase:
+                # 尝试加载前一阶段的模型作为起点
+                prev_phase_path = os.path.join(MODELS_DIR, f"{algorithm}_phase{phase_set}")
+                prev_best_path = os.path.join(MODELS_DIR, f"{algorithm}_phase{phase_set}_best")
+                prev_latest_path = os.path.join(MODELS_DIR, f"{algorithm}_phase{phase_set}_latest")
+
+                # 按优先级尝试加载前一阶段的各种模型
+                model_loaded = False
+                for path_name, path in [
+                    ("最佳模型", prev_best_path),
+                    ("最新模型", prev_latest_path),
+                    ("完成模型", prev_phase_path)
+                ]:
+                    if os.path.exists(f"{path}.zip"):
+                        print(f"强制跳过：从阶段{phase_set}的{path_name}加载")
+                        model = type(model).load(path, env=env)
+
+                        # 更新模型的学习率为当前阶段配置的学习率
+                        new_lr = model_params["learning_rate"]
+
+                        # 更新模型的学习率为当前阶段配置的学习率
+                        if hasattr(model, "learning_rate"):
+                            model.learning_rate = new_lr
+
+                        # 2. 更新策略网络(Actor)优化器的学习率
+                        if hasattr(model, "policy") and hasattr(model.policy, "optimizer"):
+                            for param_group in model.policy.optimizer.param_groups:
+                                param_group['lr'] = new_lr
+
+                        # 3. 如果使用SAC，还需要更新critic优化器的学习率
+                        if hasattr(model, "critic") and hasattr(model.critic, "optimizer"):
+                            for param_group in model.critic.optimizer.param_groups:
+                                param_group['lr'] = new_lr
+
+                        # 4. 如果有第二个critic网络
+                        if hasattr(model, "critic_target") and hasattr(model.critic_target, "optimizer"):
+                            for param_group in model.critic_target.optimizer.param_groups:
+                                param_group['lr'] = new_lr
+
+                        # 5. 如果有熵系数优化器
+                        if hasattr(model, "ent_coef_optimizer"):
+                            for param_group in model.ent_coef_optimizer.param_groups:
+                                param_group['lr'] = new_lr
+
+                        # 尝试加载对应的环境归一化状态
+                        vec_norm_path = f"{path}_vecnorm.pkl"
+                        if os.path.exists(vec_norm_path):
+                            try:
+                                from stable_baselines3.common.vec_env import VecNormalize
+                                env = VecNormalize.load(vec_norm_path, env)
+                                print(f"已加载环境归一化状态: {vec_norm_path}")
+                            except Exception as e:
+                                print(f"加载环境归一化状态失败: {e}")
+                        model_loaded = True
+                        break
+
+                # 如果没有找到模型，尝试检查点
+                if not model_loaded:
+                    # 查找前一阶段的最新检查点
+                    prev_checkpoints = [f for f in os.listdir(MODELS_DIR)
+                                        if f.startswith(f"{algorithm}_phase{phase_set}_checkpoint")
+                                        and f.endswith(".zip")]
+                    if prev_checkpoints:
+                        # 按修改时间排序，选择最新的
+                        latest_checkpoint = sorted(prev_checkpoints,
+                                                   key=lambda x: os.path.getmtime(os.path.join(MODELS_DIR, x)))[-1]
+                        checkpoint_path = os.path.join(MODELS_DIR, latest_checkpoint.replace(".zip", ""))
+                        print(f"强制跳过：从阶段{phase_set}的检查点模型加载: {latest_checkpoint}")
+                        model = type(model).load(checkpoint_path, env=env)
+
+                        # 更新模型的学习率为当前阶段配置的学习率
+                        new_lr = model_params["learning_rate"]
+
+                        # 更新模型的学习率为当前阶段配置的学习率
+                        if hasattr(model, "learning_rate"):
+                            model.learning_rate = new_lr
+
+                        # 2. 更新策略网络(Actor)优化器的学习率
+                        if hasattr(model, "policy") and hasattr(model.policy, "optimizer"):
+                            for param_group in model.policy.optimizer.param_groups:
+                                param_group['lr'] = new_lr
+
+                        # 3. 如果使用SAC，还需要更新critic优化器的学习率
+                        if hasattr(model, "critic") and hasattr(model.critic, "optimizer"):
+                            for param_group in model.critic.optimizer.param_groups:
+                                param_group['lr'] = new_lr
+
+                        # 4. 如果有第二个critic网络
+                        if hasattr(model, "critic_target") and hasattr(model.critic_target, "optimizer"):
+                            for param_group in model.critic_target.optimizer.param_groups:
+                                param_group['lr'] = new_lr
+
+                        # 5. 如果有熵系数优化器
+                        if hasattr(model, "ent_coef_optimizer"):
+                            for param_group in model.ent_coef_optimizer.param_groups:
+                                param_group['lr'] = new_lr
+
+                        # 尝试加载对应的环境归一化状态
+                        vec_norm_path = f"{checkpoint_path}_vecnorm.pkl"
+                        if os.path.exists(vec_norm_path):
+                            try:
+                                from stable_baselines3.common.vec_env import VecNormalize
+                                env = VecNormalize.load(vec_norm_path, env)
+                                print(f"已加载环境归一化状态: {vec_norm_path}")
+                            except Exception as e:
+                                print(f"加载环境归一化状态失败: {e}")
+                    else:
+                        print(f"警告：未找到阶段{phase_set}的任何模型，使用新初始化的模型")
+
+                # 尝试加载前一阶段的回放经验池
+                prev_buffer_path = os.path.join(MODELS_DIR, f"{algorithm}_phase{phase_set}_replay_buffer.pkl")
+                if os.path.exists(prev_buffer_path) and hasattr(model, "replay_buffer"):
+                    try:
+                        model.load_replay_buffer(prev_buffer_path)
+                        print(f"已加载阶段{phase_set}的回放经验池: {prev_buffer_path}")
+                    except Exception as e:
+                        print(f"加载回放经验池失败: {e}")
+            else:
+                # 正常情况下尝试加载当前阶段的模型
+                model_loaded = False
+                for path_name, path in [
+                    ("最新模型", latest_path),
+                    ("最佳模型", best_path),
+                    ("完成模型", phase_path)
+                ]:
+                    if os.path.exists(f"{path}.zip"):
+                        print(f"恢复训练：加载阶段{phase}的{path_name}")
+                        model = type(model).load(path, env=env)
+
+                        # 更新模型的学习率为当前阶段配置的学习率
+                        new_lr = model_params["learning_rate"]
+
+                        # 更新模型的学习率为当前阶段配置的学习率
+                        if hasattr(model, "learning_rate"):
+                            model.learning_rate = new_lr
+
+                        # 2. 更新策略网络(Actor)优化器的学习率
+                        if hasattr(model, "policy") and hasattr(model.policy, "optimizer"):
+                            for param_group in model.policy.optimizer.param_groups:
+                                param_group['lr'] = new_lr
+
+                        # 3. 如果使用SAC，还需要更新critic优化器的学习率
+                        if hasattr(model, "critic") and hasattr(model.critic, "optimizer"):
+                            for param_group in model.critic.optimizer.param_groups:
+                                param_group['lr'] = new_lr
+
+                        # 4. 如果有第二个critic网络
+                        if hasattr(model, "critic_target") and hasattr(model.critic_target, "optimizer"):
+                            for param_group in model.critic_target.optimizer.param_groups:
+                                param_group['lr'] = new_lr
+
+                        # 5. 如果有熵系数优化器
+                        if hasattr(model, "ent_coef_optimizer"):
+                            for param_group in model.ent_coef_optimizer.param_groups:
+                                param_group['lr'] = new_lr
+
+                        print(f"已更新所有优化器的学习率为当前阶段设置: {new_lr}")
+
+                        # 6. 验证学习率是否真的更新了
+                        if hasattr(model, "policy") and hasattr(model.policy, "optimizer"):
+                            actual_lr = model.policy.optimizer.param_groups[0]['lr']
+                            print(f"Actor优化器的实际学习率: {actual_lr}")
+
+                        # 尝试加载对应的环境归一化状态
+                        vec_norm_path = f"{path}_vecnorm.pkl"
+                        if os.path.exists(vec_norm_path):
+                            try:
+                                from stable_baselines3.common.vec_env import VecNormalize
+                                env = VecNormalize.load(vec_norm_path, env)
+                                print(f"已加载环境归一化状态: {vec_norm_path}")
+                            except Exception as e:
+                                print(f"加载环境归一化状态失败: {e}")
+                        model_loaded = True
+                        break
+
+                # 如果没有找到模型，尝试检查点
+                if not model_loaded:
+                    # 查找最新的检查点
+                    checkpoints = [f for f in os.listdir(MODELS_DIR)
+                                   if f.startswith(f"{algorithm}_phase{phase}_checkpoint")
+                                   and f.endswith(".zip")]
+                    if checkpoints:
+                        # 按修改时间排序，选择最新的
+                        latest_checkpoint = sorted(checkpoints,
+                                                   key=lambda x: os.path.getmtime(os.path.join(MODELS_DIR, x)))[-1]
+                        checkpoint_path = os.path.join(MODELS_DIR, latest_checkpoint.replace(".zip", ""))
+                        print(f"恢复训练：加载阶段{phase}的检查点模型: {latest_checkpoint}")
+                        model = type(model).load(checkpoint_path, env=env)
+
+                        # 更新模型的学习率为当前阶段配置的学习率
+                        if hasattr(model, "learning_rate"):
+                            model.learning_rate = model_params["learning_rate"]
+                            print(f"已更新学习率为当前阶段设置: {model_params['learning_rate']}")
+
+                        # 尝试加载对应的环境归一化状态
+                        vec_norm_path = f"{checkpoint_path}_vecnorm.pkl"
+                        if os.path.exists(vec_norm_path):
+                            try:
+                                from stable_baselines3.common.vec_env import VecNormalize
+                                env = VecNormalize.load(vec_norm_path, env)
+                                print(f"已加载环境归一化状态: {vec_norm_path}")
+                            except Exception as e:
+                                print(f"加载环境归一化状态失败: {e}")
+                    else:
+                        print(f"警告：未找到阶段{phase}的任何模型，使用新初始化的模型")
+
+                # 正常情况下尝试加载上一阶段的回放经验池
+                previous_buffer_path = os.path.join(MODELS_DIR, f"{algorithm}_phase{phase - 1}_replay_buffer.pkl")
+                if os.path.exists(previous_buffer_path) and hasattr(model, "replay_buffer"):
+                    try:
+                        model.load_replay_buffer(previous_buffer_path)
+                        print(f"已加载上一阶段的回放经验池: {previous_buffer_path}")
+                    except Exception as e:
+                        print(f"加载回放经验池失败: {e}")
+    else:
+        # 新阶段：检查是否需要从之前的阶段加载模型
+        load_from_phase = phase_config.get("load_from_phase")
+        if load_from_phase is not None:
+            model_path = os.path.join(MODELS_DIR, f"{algorithm}_phase{load_from_phase}")
+            if os.path.exists(f"{model_path}.zip"):
+                print(f"从阶段{load_from_phase}加载模型")
+                model = type(model).load(model_path, env=env)
+
+                # 更新模型的学习率为当前阶段配置的学习率
+                if hasattr(model, "learning_rate"):
+                    model.learning_rate = model_params["learning_rate"]
+                    print(f"已更新学习率为当前阶段设置: {model_params['learning_rate']}")
+
+                # 尝试加载对应的经验回放池
+                buffer_path = os.path.join(MODELS_DIR, f"{algorithm}_phase{load_from_phase}_replay_buffer.pkl")
+                if os.path.exists(buffer_path) and hasattr(model, "replay_buffer"):
+                    try:
+                        model.load_replay_buffer(buffer_path)
+                        print(f"已加载阶段{load_from_phase}的回放经验池")
+                    except Exception as e:
+                        print(f"加载回放经验池失败: {e}")
+            else:
+                print(f"警告: 未找到阶段{load_from_phase}的模型，使用新初始化的模型")
+
+
+def train_with_curriculum(env_class, curriculum_config, resume=False, phase_set=None, verbose=False):
     """
     使用课程学习训练智能体
 
@@ -432,231 +737,22 @@ def train_with_curriculum(env_class, curriculum_config, resume=False, phase_set=
         print(f"阶段{phase}: {phase_config['name']}...")
 
         # 创建训练环境
-        env = create_env_from_config(env_class, phase_config["env_config"], is_eval=False)
+        env = create_env_from_config(env_class, phase_config["env_config"], is_eval=False, verbose=verbose)
 
         # 创建评估环境
-        eval_env = create_env_from_config(env_class, phase_config["env_config"], is_eval=True)
+        eval_env = create_env_from_config(env_class, phase_config["env_config"], is_eval=True, verbose=verbose)
 
         # 获取当前阶段的模型参数
         model_params = phase_config["model_params"][algorithm]
+        if verbose >= 2:
+            print(f"当前阶段{phase}, 当前学习率为:{model_params['learning_rate']}")
 
         # 创建模型
         model = create_model_from_config(algorithm, env, model_params)
-
+        if verbose >= 2:
+            print(f"当前阶段{phase}, 模型创建后的学习率为:{model.learning_rate}")
         # 处理模型加载逻辑
-        if resume and phase == start_phase:
-            # 恢复训练：优先加载保存的训练状态中的模型
-            if "model_path" in state and os.path.exists(f"{state['model_path']}.zip"):
-                print(f"从保存的训练状态加载模型: {state['model_path']}")
-                try:
-                    # 使用load方法加载模型，但保留当前阶段的学习率设置
-                    model = type(model).load(state["model_path"], env=env)
-
-                    # 更新模型的学习率为当前阶段配置的学习率
-                    if hasattr(model, "learning_rate"):
-                        model.learning_rate = model_params["learning_rate"]
-                        print(f"已更新学习率为当前阶段设置: {model_params['learning_rate']}")
-
-                    print("模型加载成功")
-
-                    # 恢复环境状态（如果有）
-                    if "env_state_path" in state and state["env_state_path"] and os.path.exists(
-                            state["env_state_path"]):
-                        try:
-                            from stable_baselines3.common.vec_env import VecNormalize
-                            if isinstance(env, VecNormalize):
-                                env = VecNormalize.load(state["env_state_path"], env)
-                                print(f"已加载环境归一化状态: {state['env_state_path']}")
-                            elif hasattr(env, "load"):
-                                env.load(state["env_state_path"])
-                                print(f"已加载环境状态: {state['env_state_path']}")
-                        except Exception as e:
-                            print(f"加载环境状态失败: {e}")
-
-                    # 恢复经验回放池（如果有）
-                    if "replay_buffer_path" in state and state["replay_buffer_path"] and os.path.exists(
-                            state["replay_buffer_path"]):
-                        try:
-                            model.load_replay_buffer(state["replay_buffer_path"])
-                            print(f"已加载经验回放池: {state['replay_buffer_path']}")
-                        except Exception as e:
-                            print(f"加载经验回放池失败: {e}")
-                except Exception as e:
-                    print(f"从训练状态加载模型失败: {e}，尝试其他模型加载方式")
-                    # 如果加载失败，继续尝试其他加载方式
-
-            # 如果没有找到训练状态中的模型或加载失败，则按原来的逻辑尝试加载
-            if not ("model_path" in state and os.path.exists(f"{state['model_path']}.zip")):
-                latest_path = os.path.join(MODELS_DIR, f"{algorithm}_phase{phase}_latest")
-                best_path = os.path.join(MODELS_DIR, f"{algorithm}_phase{phase}_best")
-                phase_path = os.path.join(MODELS_DIR, f"{algorithm}_phase{phase}")
-
-                # 处理强制跳过阶段的情况
-                if phase_set is not None and phase == start_phase:
-                    # 尝试加载前一阶段的模型作为起点
-                    prev_phase_path = os.path.join(MODELS_DIR, f"{algorithm}_phase{phase_set}")
-                    prev_best_path = os.path.join(MODELS_DIR, f"{algorithm}_phase{phase_set}_best")
-                    prev_latest_path = os.path.join(MODELS_DIR, f"{algorithm}_phase{phase_set}_latest")
-
-                    # 按优先级尝试加载前一阶段的各种模型
-                    model_loaded = False
-                    for path_name, path in [
-                        ("最佳模型", prev_best_path),
-                        ("最新模型", prev_latest_path),
-                        ("完成模型", prev_phase_path)
-                    ]:
-                        if os.path.exists(f"{path}.zip"):
-                            print(f"强制跳过：从阶段{phase_set}的{path_name}加载")
-                            model = type(model).load(path, env=env)
-
-                            # 更新模型的学习率为当前阶段配置的学习率
-                            if hasattr(model, "learning_rate"):
-                                model.learning_rate = model_params["learning_rate"]
-                                print(f"已更新学习率为当前阶段设置: {model_params['learning_rate']}")
-
-                            # 尝试加载对应的环境归一化状态
-                            vec_norm_path = f"{path}_vecnorm.pkl"
-                            if os.path.exists(vec_norm_path):
-                                try:
-                                    from stable_baselines3.common.vec_env import VecNormalize
-                                    env = VecNormalize.load(vec_norm_path, env)
-                                    print(f"已加载环境归一化状态: {vec_norm_path}")
-                                except Exception as e:
-                                    print(f"加载环境归一化状态失败: {e}")
-                            model_loaded = True
-                            break
-
-                    # 如果没有找到模型，尝试检查点
-                    if not model_loaded:
-                        # 查找前一阶段的最新检查点
-                        prev_checkpoints = [f for f in os.listdir(MODELS_DIR)
-                                            if f.startswith(f"{algorithm}_phase{phase_set}_checkpoint")
-                                            and f.endswith(".zip")]
-                        if prev_checkpoints:
-                            # 按修改时间排序，选择最新的
-                            latest_checkpoint = sorted(prev_checkpoints,
-                                                       key=lambda x: os.path.getmtime(os.path.join(MODELS_DIR, x)))[-1]
-                            checkpoint_path = os.path.join(MODELS_DIR, latest_checkpoint.replace(".zip", ""))
-                            print(f"强制跳过：从阶段{phase_set}的检查点模型加载: {latest_checkpoint}")
-                            model = type(model).load(checkpoint_path, env=env)
-
-                            # 更新模型的学习率为当前阶段配置的学习率
-                            if hasattr(model, "learning_rate"):
-                                model.learning_rate = model_params["learning_rate"]
-                                print(f"已更新学习率为当前阶段设置: {model_params['learning_rate']}")
-
-                            # 尝试加载对应的环境归一化状态
-                            vec_norm_path = f"{checkpoint_path}_vecnorm.pkl"
-                            if os.path.exists(vec_norm_path):
-                                try:
-                                    from stable_baselines3.common.vec_env import VecNormalize
-                                    env = VecNormalize.load(vec_norm_path, env)
-                                    print(f"已加载环境归一化状态: {vec_norm_path}")
-                                except Exception as e:
-                                    print(f"加载环境归一化状态失败: {e}")
-                        else:
-                            print(f"警告：未找到阶段{phase_set}的任何模型，使用新初始化的模型")
-
-                    # 尝试加载前一阶段的回放经验池
-                    prev_buffer_path = os.path.join(MODELS_DIR, f"{algorithm}_phase{phase_set}_replay_buffer.pkl")
-                    if os.path.exists(prev_buffer_path) and hasattr(model, "replay_buffer"):
-                        try:
-                            model.load_replay_buffer(prev_buffer_path)
-                            print(f"已加载阶段{phase_set}的回放经验池: {prev_buffer_path}")
-                        except Exception as e:
-                            print(f"加载回放经验池失败: {e}")
-                else:
-                    # 正常情况下尝试加载当前阶段的模型
-                    model_loaded = False
-                    for path_name, path in [
-                        ("最新模型", latest_path),
-                        ("最佳模型", best_path),
-                        ("完成模型", phase_path)
-                    ]:
-                        if os.path.exists(f"{path}.zip"):
-                            print(f"恢复训练：加载阶段{phase}的{path_name}")
-                            model = type(model).load(path, env=env)
-
-                            # 更新模型的学习率为当前阶段配置的学习率
-                            if hasattr(model, "learning_rate"):
-                                model.learning_rate = model_params["learning_rate"]
-                                print(f"已更新学习率为当前阶段设置: {model_params['learning_rate']}")
-
-                            # 尝试加载对应的环境归一化状态
-                            vec_norm_path = f"{path}_vecnorm.pkl"
-                            if os.path.exists(vec_norm_path):
-                                try:
-                                    from stable_baselines3.common.vec_env import VecNormalize
-                                    env = VecNormalize.load(vec_norm_path, env)
-                                    print(f"已加载环境归一化状态: {vec_norm_path}")
-                                except Exception as e:
-                                    print(f"加载环境归一化状态失败: {e}")
-                            model_loaded = True
-                            break
-
-                    # 如果没有找到模型，尝试检查点
-                    if not model_loaded:
-                        # 查找最新的检查点
-                        checkpoints = [f for f in os.listdir(MODELS_DIR)
-                                       if f.startswith(f"{algorithm}_phase{phase}_checkpoint")
-                                       and f.endswith(".zip")]
-                        if checkpoints:
-                            # 按修改时间排序，选择最新的
-                            latest_checkpoint = sorted(checkpoints,
-                                                       key=lambda x: os.path.getmtime(os.path.join(MODELS_DIR, x)))[-1]
-                            checkpoint_path = os.path.join(MODELS_DIR, latest_checkpoint.replace(".zip", ""))
-                            print(f"恢复训练：加载阶段{phase}的检查点模型: {latest_checkpoint}")
-                            model = type(model).load(checkpoint_path, env=env)
-
-                            # 更新模型的学习率为当前阶段配置的学习率
-                            if hasattr(model, "learning_rate"):
-                                model.learning_rate = model_params["learning_rate"]
-                                print(f"已更新学习率为当前阶段设置: {model_params['learning_rate']}")
-
-                            # 尝试加载对应的环境归一化状态
-                            vec_norm_path = f"{checkpoint_path}_vecnorm.pkl"
-                            if os.path.exists(vec_norm_path):
-                                try:
-                                    from stable_baselines3.common.vec_env import VecNormalize
-                                    env = VecNormalize.load(vec_norm_path, env)
-                                    print(f"已加载环境归一化状态: {vec_norm_path}")
-                                except Exception as e:
-                                    print(f"加载环境归一化状态失败: {e}")
-                        else:
-                            print(f"警告：未找到阶段{phase}的任何模型，使用新初始化的模型")
-
-                    # 正常情况下尝试加载上一阶段的回放经验池
-                    previous_buffer_path = os.path.join(MODELS_DIR, f"{algorithm}_phase{phase - 1}_replay_buffer.pkl")
-                    if os.path.exists(previous_buffer_path) and hasattr(model, "replay_buffer"):
-                        try:
-                            model.load_replay_buffer(previous_buffer_path)
-                            print(f"已加载上一阶段的回放经验池: {previous_buffer_path}")
-                        except Exception as e:
-                            print(f"加载回放经验池失败: {e}")
-        else:
-            # 新阶段：检查是否需要从之前的阶段加载模型
-            load_from_phase = phase_config.get("load_from_phase")
-            if load_from_phase is not None:
-                model_path = os.path.join(MODELS_DIR, f"{algorithm}_phase{load_from_phase}")
-                if os.path.exists(f"{model_path}.zip"):
-                    print(f"从阶段{load_from_phase}加载模型")
-                    model = type(model).load(model_path, env=env)
-
-                    # 更新模型的学习率为当前阶段配置的学习率
-                    if hasattr(model, "learning_rate"):
-                        model.learning_rate = model_params["learning_rate"]
-                        print(f"已更新学习率为当前阶段设置: {model_params['learning_rate']}")
-
-                    # 尝试加载对应的经验回放池
-                    buffer_path = os.path.join(MODELS_DIR, f"{algorithm}_phase{load_from_phase}_replay_buffer.pkl")
-                    if os.path.exists(buffer_path) and hasattr(model, "replay_buffer"):
-                        try:
-                            model.load_replay_buffer(buffer_path)
-                            print(f"已加载阶段{load_from_phase}的回放经验池")
-                        except Exception as e:
-                            print(f"加载回放经验池失败: {e}")
-                else:
-                    print(f"警告: 未找到阶段{load_from_phase}的模型，使用新初始化的模型")
+        resume_processor(resume, phase, start_phase, total_phases, model, model_params, env, algorithm, phase_set, phase_config)
 
         # 初始化阶段训练参数
         base_steps = base_timesteps_per_phase
@@ -683,8 +779,9 @@ def train_with_curriculum(env_class, curriculum_config, resume=False, phase_set=
             eval_env=eval_env,
             phase=phase,
             reward_threshold=phase_config["reward_threshold"],
-            std_threshold_ratio=0.2,  # 标准差不超过平均值的20%
+            std_threshold_ratio=1.0,  # 标准差不超过平均值的20%
             n_eval_episodes=10,
+            early_stop_patience=10,
             eval_freq=eval_freq,
             log_path=log_path,
             best_model_save_path=best_model_path,
@@ -712,15 +809,13 @@ def train_with_curriculum(env_class, curriculum_config, resume=False, phase_set=
             max_checkpoints=5
         )
         all_callbacks.append(checkpoint_callback)
-
         # 创建学习率调度回调
-        lr_schedule = {
-            0: model_params["learning_rate"],  # 从0步开始使用配置的学习率
-            100000: model_params["learning_rate"] * 0.1,  # 从100000步开始使用学习率的0.1倍
-            200000: model_params["learning_rate"] * (0.1 ** 2),  # 从200000步开始使用学习率的0.01倍
-            300000: model_params["learning_rate"] * (0.1 ** 3)  # 从300000步开始使用学习率的0.001倍
-        }
-        learning_rate_callback = StepwiseLRSchedulerCallback(lr_schedule, verbose=1)
+        learning_rate_callback = LinearLRDecayCallback(
+            verbose=2,
+            decay_start_step=0,  # 从第0步开始衰减
+            decay_end_step=500000,  # 到第90000步结束衰减
+            final_lr_fraction=0.1  # 最终学习率为初始学习率的10%
+        )
         all_callbacks.append(learning_rate_callback)
 
         # 计算剩余训练步数

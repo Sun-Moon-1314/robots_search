@@ -20,7 +20,7 @@ os.makedirs(LOGS_DIR, exist_ok=True)
 # 环境配置
 ENV_CONFIG = {
     "maze_size": (7, 7),
-    "max_steps": 1000,
+    "max_steps": 600,
     "render_mode": None,
     "verbose": False
 }

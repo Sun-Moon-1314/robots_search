@@ -221,48 +221,78 @@ class EarlyStoppingException(Exception):
     pass
 
 
-class StepwiseLRSchedulerCallback(BaseCallback):
+class LinearLRDecayCallback(BaseCallback):
     """
-    阶梯式学习率调度回调，在预定义的步数区间内使用固定学习率
-    确保学习率更新正确应用到优化器并在日志中正确显示
+    基于初始学习率的线性衰减回调函数
     """
 
-    def __init__(self, lr_schedule, verbose=0):
+    def __init__(self, verbose=0, decay_start_step=0, decay_end_step=None, final_lr_fraction=0.1):
         """
-        初始化
-
-        Args:
-            lr_schedule: 字典，键为步数阈值，值为对应的学习率
-                         例如 {0: 0.001, 50000: 0.0005, 100000: 0.0001}
-            verbose: 详细程度
+        参数:
+            verbose: 日志详细程度
+            decay_start_step: 开始衰减的步数
+            decay_end_step: 结束衰减的步数，如果为None则使用总训练步数
+            final_lr_fraction: 最终学习率相对于初始学习率的比例
         """
-        super().__init__(verbose)
-        self.lr_schedule = sorted(lr_schedule.items())
-        self.current_lr = None
+        super(LinearLRDecayCallback, self).__init__(verbose)
+        self.decay_start_step = decay_start_step
+        self.decay_end_step = decay_end_step
+        self.final_lr_fraction = final_lr_fraction
+        self.initial_lr = None
 
-    def _on_step(self):
-        # 获取当前步数
-        current_step = self.num_timesteps
-        new_lr = None
+    def _init_callback(self) -> None:
+        """初始化回调，获取初始学习率"""
+        if self.initial_lr is None:
+            self.initial_lr = self.model.learning_rate
+        self.current_lr = self.initial_lr
+        print(f"初始学习率: {self.initial_lr}")
 
-        # 查找当前步数应该使用的学习率
-        for step_threshold, lr in self.lr_schedule:
-            if current_step >= step_threshold:
-                new_lr = lr
+        # 验证模型优化器结构
+        if hasattr(self.model, 'policy'):
+            if hasattr(self.model.policy, 'optimizer'):
+                print("模型使用单个优化器")
+            elif hasattr(self.model.policy, 'actor') and hasattr(self.model.policy.actor, 'optimizer'):
+                print("模型使用分离的Actor优化器")
+            elif hasattr(self.model.policy, 'critic') and hasattr(self.model.policy.critic, 'optimizer'):
+                print("模型使用分离的Critic优化器")
+            else:
+                print("警告: 无法识别优化器结构")
 
-        # 只有当学习率需要变化时才更新
-        if new_lr is not None and new_lr != self.current_lr:
-            self.current_lr = new_lr
+    def _on_step(self) -> bool:
+        """每步更新学习率"""
+        # 只在特定步数更新学习率，例如每100步
+        if self.decay_start_step <= self.n_calls <= self.decay_end_step and self.n_calls % 1000 == 0:
+            # 只有在衰减范围内才调整学习率
+            if self.decay_start_step <= self.n_calls <= self.decay_end_step:
+                # 计算当前进度
+                progress = (self.n_calls - self.decay_start_step) / (self.decay_end_step - self.decay_start_step)
+                # 线性衰减：从初始值到 final_lr_fraction * 初始值
+                current_lr = self.initial_lr * (1 - (1 - self.final_lr_fraction) * progress)
 
-            # 更新优化器中的学习率 - 这是关键步骤
-            if hasattr(self.model, 'policy') and hasattr(self.model.policy, 'optimizer'):
-                for param_group in self.model.policy.optimizer.param_groups:
-                    param_group['lr'] = new_lr
+                # 更新PPO优化器
+                if hasattr(self.model, 'policy') and hasattr(self.model.policy, 'optimizer'):
+                    for param_group in self.model.policy.optimizer.param_groups:
+                        param_group['lr'] = current_lr
 
-                # 记录到日志
-                self.logger.record("train/learning_rate", new_lr)
+                # 更新SAC优化器
+                if hasattr(self.model, 'actor') and hasattr(self.model.actor, 'optimizer'):
+                    for param_group in self.model.actor.optimizer.param_groups:
+                        param_group['lr'] = current_lr
 
-                if self.verbose > 0:
-                    print(f"步数 {current_step}: 学习率更新为 {new_lr:.6f}")
+                if hasattr(self.model, 'critic') and hasattr(self.model.critic, 'optimizer'):
+                    for param_group in self.model.critic.optimizer.param_groups:
+                        param_group['lr'] = current_lr
+
+                # 更新SAC温度参数优化器(如果有)
+                if hasattr(self.model, 'log_ent_coef') and hasattr(self.model,
+                                                                   'ent_coef_optimizer') and self.model.ent_coef_optimizer is not None:
+                    for param_group in self.model.ent_coef_optimizer.param_groups:
+                        param_group['lr'] = current_lr
+
+                # 更新SB3的日志值（尝试覆盖内部记录的学习率）
+                if hasattr(self.model, 'logger') and self.model.logger:
+                    self.model.logger.record("train/learning_rate", current_lr)
+                if self.model.logger:
+                    self.model.logger.record("custom/actual_learning_rate", current_lr)
 
         return True

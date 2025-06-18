@@ -7,7 +7,7 @@
 
 import os
 import numpy as np
-import time
+import pybullet as p
 import traceback
 from stable_baselines3 import PPO, SAC, A2C
 from stable_baselines3.common.monitor import Monitor
@@ -56,13 +56,30 @@ def evaluate_model(model, env, vec_normalize_path=None, n_eval_episodes=10):
     return float(mean_reward)
 
 
-def evaluate_sb3(model_path, env_class, episodes=5, phase=2, render_mode="human", verbose=False):
+def get_base_env(env):
+    """获取最底层的环境实例，穿透所有包装器"""
+    # 处理向量化环境
+    if hasattr(env, 'venv'):
+        env = env.venv
+
+    if hasattr(env, 'envs') and len(env.envs) > 0:
+        env = env.envs[0]
+
+    # 处理单环境包装器，如Monitor
+    while hasattr(env, 'env'):
+        env = env.env
+
+    return env
+
+
+def evaluate_sb3(model_path, env_class, curriculum_config, episodes=5, phase=2, render_mode="human", verbose=False):
     """
     评估训练好的SB3模型
 
     Args:
         model_path: 模型路径
         env_class: 环境类
+        curriculum_config: 课程学习配置
         episodes: 评估回合数
         phase: 课程阶段
         render_mode: 渲染模式
@@ -91,26 +108,41 @@ def evaluate_sb3(model_path, env_class, episodes=5, phase=2, render_mode="human"
     vec_normalize_path = os.path.join(os.path.dirname(model_path),
                                       f"vec_normalize_{algorithm}_{model_phase}.pkl")
     print(f"加载归一化文件:{vec_normalize_path}")
+
+    # 获取当前阶段的课程配置
+    phase_config = curriculum_config["phases"].get(phase, {})
+    env_config = phase_config.get("env_config", {})
+
     # 创建环境
     env = env_class(maze_size=(7, 7), render_mode=render_mode, verbose=verbose)
     print(f"启动阶段-{phase}模型评估")
 
     # 根据阶段设置环境参数
     env.curriculum_phase = phase
-    if phase == 1:
-        env.ball_pos = (1, 2)
-        env.goal_pos = env.ball_pos
-    elif phase == 2:
-        env.ball_pos = (1, 3)
-        env.goal_pos = env.ball_pos
-    # phase 3使用默认设置
-    elif phase == 3:
-        env.ball_pos = (1, 3)
-        env.goal_pos = env.ball_pos
-    # 包装环境以匹配训练时的结构
-    env = Monitor(env)
-    env = DummyVecEnv([lambda: env])
 
+    # 使用课程配置中的随机位置列表
+    random_positions = env_config.get("random_positions", [])
+
+    if random_positions:
+        print(f"使用阶段{phase}的随机位置列表: {random_positions}")
+    else:
+        # 如果没有配置，使用默认位置
+        if phase == 1:
+            random_positions = [(1, 2), (2, 1)]
+        elif phase == 2:
+            random_positions = [(1, 3), (3, 1), (2, 3), (3, 2)]
+        elif phase == 3:
+            random_positions = [(1, 5), (5, 1), (4, 4), (5, 3), (3, 5)]
+        print(f"使用默认随机位置列表: {random_positions}")
+
+    # 设置环境的随机位置列表
+    env.use_random_positions = True
+    env.random_positions = random_positions
+
+    # 包装环境以匹配训练时的结构
+    env_m = Monitor(env)
+    env = DummyVecEnv([lambda: env_m])
+    obs = env.reset()
     # 如果存在归一化文件，加载它
     if os.path.exists(vec_normalize_path):
         print(f"加载归一化统计数据: {vec_normalize_path}")
@@ -129,12 +161,39 @@ def evaluate_sb3(model_path, env_class, episodes=5, phase=2, render_mode="human"
         episode_steps = []
 
         for episode in range(episodes):
+            # 在每个回合开始前随机选择球位置
+            import random
+            ball_pos = random.choice(random_positions)
+
+            print(f"\n===== 评估回合 {episode + 1}/{episodes} =====")
+            # print(f"当前回合设置球位置: {ball_pos}")
+
+            # 获取底层环境
+            # 获取最底层环境实例
+            inner_env = get_base_env(env)
+            print(f"上个回合球的位置：{inner_env.ball_pos}")
+            # 直接设置内部环境的球位置
+            inner_env.ball_pos = ball_pos
+            inner_env.goal_pos = ball_pos
+
+            # 先调用reset获取初始观察
             obs = env.reset()
+
+            # 重要：确保球位置设置正确反映在物理世界中
+            if hasattr(inner_env, 'ball_id') and inner_env.ball_id is not None:
+
+                world_pos, _ = p.getBasePositionAndOrientation(
+                    inner_env.ball_id,
+                    physicsClientId=inner_env.client_id
+                )
+                # print(f"reset后球的物理位置: {world_pos}")
+                print(f"reset后球的网格位置: {inner_env.ball_pos}")
+            else:
+                print("警告：无法获取球体ID，无法设置物理位置")
+
             done = False
             total_reward = 0
             steps = 0
-
-            print(f"\n===== 评估回合 {episode + 1}/{episodes} =====")
 
             while not done:
                 action, _ = model.predict(obs, deterministic=True)
@@ -155,6 +214,14 @@ def evaluate_sb3(model_path, env_class, episodes=5, phase=2, render_mode="human"
                     distance = info.get('distance_to_ball', 'N/A')
                     print(
                         f"步骤: {steps}, 奖励: {original_reward:.2f}, 累计奖励: {total_reward:.2f}, 到球距离: {distance}")
+
+                    # 打印当前球位置，确认未被更改
+                    if verbose and hasattr(inner_env, 'ball_id'):
+                        world_pos, _ = p.getBasePositionAndOrientation(
+                            inner_env.ball_id,
+                            physicsClientId=inner_env.client_id
+                        )
+                        print(f"当前球物理位置: {world_pos}")
 
             # 记录本回合结果
             episode_rewards.append(total_reward)

@@ -6,6 +6,7 @@
 """
 
 import numpy as np
+import math
 
 
 def get_reward_config(curriculum_phase):
@@ -247,17 +248,35 @@ def get_reward_config(curriculum_phase):
     return config
 
 
-def compute_reward(env, info):
+def compute_reward(env, observation, info):
     """
     计算标准化的奖励函数，所有分量都缩放到[-1, 1]范围
 
     Args:
         env: 环境实例
+        observation: 观察空间中的状态信息 (22维向量)
         info: 当前状态信息
 
     Returns:
         float: 计算得到的奖励值
     """
+    # 观察空间索引定义
+    OBS_IDX = {
+        'robot_pos': slice(0, 2),  # [0, 1] - 机器人位置 (x, y)
+        'robot_yaw': 2,  # [2] - 机器人朝向角 (yaw)
+        'ball_pos': slice(3, 5),  # [3, 4] - 球位置 (x, y)
+        'roll': 5,  # [5] - roll角
+        'pitch': 6,  # [6] - pitch角
+        'roll_rate': 7,  # [7] - roll角速度
+        'pitch_rate': 8,  # [8] - pitch角速度
+        'laser_data': slice(9, 17),  # [9-16] - 8个激光数据
+        'distance_to_ball': 17,  # [17] - 到球距离
+        'orientation_alignment': 18,  # [18] - 朝向一致性
+        'forward_velocity': 19,  # [19] - 前进速度
+        'lateral_velocity': 20,  # [20] - 侧向速度
+        'movement_alignment': 21  # [21] - 移动一致性
+    }
+
     # 获取当前课程阶段
     current_phase = getattr(env, 'curriculum_phase', 3)
 
@@ -279,8 +298,8 @@ def compute_reward(env, info):
 
     # ===== 核心奖励计算 =====
 
-    # 1. 距离奖励计算
-    distance_to_ball = info['distance_to_ball']
+    # 1. 距离奖励计算 - 直接从观察空间获取
+    distance_to_ball = observation[OBS_IDX['distance_to_ball']]
 
     # 确保prev_distance_to_ball属性存在
     if not hasattr(env, 'prev_distance_to_ball'):
@@ -317,8 +336,10 @@ def compute_reward(env, info):
     reward_components['distance'] = raw_distance_reward
     normalized_components['distance'] = raw_distance_reward  # 已经标准化
 
-    # 2. 平衡奖励计算
-    tilt_angle = info['balance_angle']
+    # 2. 平衡奖励计算 - 从观察空间获取
+    roll = observation[OBS_IDX['roll']]
+    pitch = observation[OBS_IDX['pitch']]
+    tilt_angle = math.sqrt(roll ** 2 + pitch ** 2)  # 计算总倾斜角度
 
     # 标准化平衡奖励到[-1, 0]范围
     # 假设最大倾斜角度为t['fallen']
@@ -347,8 +368,8 @@ def compute_reward(env, info):
     reward_components['fallen'] = raw_fallen_penalty
     normalized_components['fallen'] = raw_fallen_penalty  # 已经标准化
 
-    # 4. 速度奖励计算
-    forward_velocity = info.get('forward_velocity', 0.0)
+    # 4. 速度奖励计算 - 从观察空间获取
+    forward_velocity = observation[OBS_IDX['forward_velocity']]
 
     # 标准化速度奖励到[-1, 1]范围
     # 假设最大合理速度为1.0单位/步
@@ -365,9 +386,9 @@ def compute_reward(env, info):
 
     # ===== 可选奖励计算 =====
 
-    # 5. 朝向奖励（可选）- 保留但在阶段2和3中不使用，改用alignment
+    # 5. 朝向奖励（可选）- 从观察空间获取
     if en.get('orientation_penalty', False):
-        orientation_alignment = info.get('orientation_alignment', 0.0)
+        orientation_alignment = observation[OBS_IDX['orientation_alignment']]
         # orientation_alignment值为1表示完全一致，0表示垂直，-1表示完全相反
 
         # 新逻辑：只要不完全一致就给予惩罚，惩罚程度与偏离程度成正比
@@ -375,15 +396,8 @@ def compute_reward(env, info):
             # 将[1, -1]映射到[0, 1]范围，1表示无偏差，-1表示完全相反
             deviation = (1.0 - orientation_alignment) / 2.0  # 归一化到[0, 1]
 
-            # 可以选择线性惩罚或二次惩罚
-            # 线性惩罚：偏离越大，惩罚越大，但增长是线性的
-            # orientation_penalty = deviation
-
             # 二次惩罚：偏离越大，惩罚增长越快
             orientation_penalty = deviation ** 2
-
-            # 或者使用更强的惩罚函数，如立方
-            # orientation_penalty = deviation ** 3
 
             reward_components['orientation_penalty'] = -orientation_penalty  # 负值表示惩罚
             normalized_components['orientation_penalty'] = -orientation_penalty
@@ -395,9 +409,9 @@ def compute_reward(env, info):
         reward_components['orientation_penalty'] = 0.0
         normalized_components['orientation_penalty'] = 0.0
 
-    # 6. 侧向速度惩罚（可选）
+    # 6. 侧向速度惩罚（可选）- 从观察空间获取
     if en.get('lateral', False):
-        lateral_velocity = info.get('lateral_velocity', 0.0)
+        lateral_velocity = observation[OBS_IDX['lateral_velocity']]
         # 标准化侧向速度到[-1, 0]范围
         max_expected_lateral = 0.5  # 假设最大合理侧向速度
         normalized_lateral = min(abs(lateral_velocity) / max_expected_lateral, 1.0)
@@ -408,19 +422,14 @@ def compute_reward(env, info):
         reward_components['lateral'] = 0.0
         normalized_components['lateral'] = 0.0
 
-    # 7. 移动方向与朝向一致性奖励（可选）- 在阶段2和3中替代orientation
+    # 7. 移动方向与朝向一致性奖励（可选）- 从观察空间获取
     if en.get('alignment', False):
-        movement_alignment = info.get('movement_orientation_alignment', 0.0)
+        movement_alignment = observation[OBS_IDX['movement_alignment']]
         # 假设movement_alignment在[-1, 1]范围内
-        # 将对齐度转换为惩罚：完全对齐(1)时惩罚为0，完全不对齐(-1)时惩罚最大
 
-        # 方案1: 线性惩罚 - 将[-1, 1]映射到[惩罚最大值, 0]
-        # raw_alignment_penalty = max(0, (1 - movement_alignment) / 2)  # 映射到[0, 1]范围
+        # 非线性惩罚 - 不对齐时惩罚更严厉
+        raw_alignment_penalty = max(0, (1 - movement_alignment) ** 2)
 
-        # 或者方案2: 非线性惩罚 - 不对齐时惩罚更严厉
-        raw_alignment_penalty = max(0, (1 - movement_alignment)**2)
-
-        # 可以根据需要调整惩罚强度
         reward_components['alignment'] = -raw_alignment_penalty
         normalized_components['alignment'] = -raw_alignment_penalty
     else:
@@ -441,7 +450,7 @@ def compute_reward(env, info):
         reward_components['energy'] = 0.0
         normalized_components['energy'] = 0.0
 
-    # 9. 碰撞惩罚（可选）
+    # 9. 碰撞惩罚（可选）- 仍从info获取，因为这是环境状态而非观察
     if en.get('collision', False):
         # 碰撞是二元事件，直接映射到{-1, 0}
         raw_collision_penalty = -1.0 if info['collision'] else 0.0
@@ -461,7 +470,7 @@ def compute_reward(env, info):
         reward_components['alive'] = 0.0
         normalized_components['alive'] = 0.0
 
-    # 11. 进度奖励（可选）
+    # 11. 进度奖励（可选）- 使用观察空间中的距离信息
     if en.get('progress', False):
         # 确保initial_distance_to_ball属性存在
         if not hasattr(env, 'initial_distance_to_ball'):
@@ -486,7 +495,7 @@ def compute_reward(env, info):
             reward += w[key] * normalized_components[key]
 
     # 调试信息
-    if hasattr(env, 'verbose') and env.verbose and env.current_step % 20 == 0:
+    if hasattr(env, 'verbose') and env.verbose >= 2 and env.current_step % 1000 == 0:
         debug_str = f"阶段{current_phase} {'评估' if is_eval_mode else '训练'} 奖励明细: "
 
         # 添加所有启用的奖励信息

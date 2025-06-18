@@ -9,7 +9,7 @@
 DEFAULT_CURRICULUM = {
     "algorithm": "SAC",
     "total_phases": 3,
-    "timesteps_per_phase": 500000,
+    "timesteps_per_phase": 300000,
     "eval_freq": 10000,
     "phases": {
         1: {
@@ -17,8 +17,9 @@ DEFAULT_CURRICULUM = {
             "env_config": {
                 "maze_size": (7, 7),
                 "curriculum_phase": 1,
-                "ball_pos": (1, 2),
-                "goal_pos": "ball_pos",
+                "random_positions": [(1, 2), (2, 1)],
+                "ball_pos": None,
+                "goal_pos": None,
             },
             "model_params": {
                 "SAC": {
@@ -36,7 +37,7 @@ DEFAULT_CURRICULUM = {
                     "ent_coef": 0.01
                 }
             },
-            "reward_threshold": 0.2,
+            "reward_threshold": 200.0,
             "difficulty_factor": 0.8,  # 简单阶段，训练步数减少
             "max_attempts": 2,
             "load_from_phase": None
@@ -46,8 +47,9 @@ DEFAULT_CURRICULUM = {
             "env_config": {
                 "maze_size": (7, 7),
                 "curriculum_phase": 2,
-                "ball_pos": (1, 3),
-                "goal_pos": (1, 3),
+                "random_positions": [(1, 3), (3, 1), (2, 3), (3, 2)],
+                "ball_pos": None,
+                "goal_pos": None,
             },
             "model_params": {
                 "SAC": {
@@ -75,8 +77,9 @@ DEFAULT_CURRICULUM = {
             "env_config": {
                 "maze_size": (7, 7),
                 "curriculum_phase": 3,
-                "ball_pos": (1, 5),
-                "goal_pos": (1, 5),
+                "random_positions": [(1, 5), (5, 1), (4, 4), (5, 3), (3, 5)],
+                "ball_pos": None,
+                "goal_pos": None,
             },
             "model_params": {
                 "SAC": {
