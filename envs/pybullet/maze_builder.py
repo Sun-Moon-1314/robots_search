@@ -28,6 +28,7 @@ class MazeBuilder:
         self.cell_size = cell_size
         self.wall_height = wall_height
         self.wall_thickness = 0.1
+        self.radius = self.cell_size / 4
 
         # 对象ID列表
         self.plane_id = None
@@ -171,22 +172,22 @@ class MazeBuilder:
 
         goal_visual_shape_id = p.createVisualShape(
             shapeType=p.GEOM_SPHERE,
-            radius=self.cell_size / 4,
+            radius=self.radius,
             rgbaColor=[1.0, 0.0, 0.0, 1.0],  # 红色
             physicsClientId=self.client_id
         )
 
         goal_collision_shape_id = p.createCollisionShape(
             shapeType=p.GEOM_SPHERE,
-            radius=self.cell_size / 4,
+            radius=self.radius,
             physicsClientId=self.client_id
         )
 
         self.ball_id = p.createMultiBody(
-            baseMass=1,  # 静态物体
+            baseMass=10,
             baseCollisionShapeIndex=goal_collision_shape_id,
             baseVisualShapeIndex=goal_visual_shape_id,
-            basePosition=[goal_x, goal_y, 0.5],
+            basePosition=[goal_x, goal_y, self.radius],
             physicsClientId=self.client_id
         )
 
@@ -229,7 +230,7 @@ class MazeBuilder:
             goal_y = goal_pos[1] * self.cell_size + self.cell_size / 2
             p.resetBasePositionAndOrientation(
                 self.ball_id,
-                [goal_x, goal_y, 0.5],  # 位置
+                [goal_x, goal_y, self.radius],  # 位置
                 [0, 0, 0, 1],  # 方向（四元数）
                 physicsClientId=self.client_id
             )

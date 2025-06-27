@@ -1,110 +1,190 @@
+import signal
 import os
 
-from stable_baselines3 import PPO, SAC, A2C
-from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+from graphene.types.scalars import MAX_INT
 
+from config.maze_search.curriculum_config import TRAINER_CONFIG
 from config.maze_search.default_config import LOGS_DIR, MODELS_DIR
+from training.callbacks import SaveModelLogCallback, CurriculumEvalCallback, SaveLatestModelCallback, \
+    SaveCheckpointCallback, LinearLRDecayCallback, RewardMetricsCallback, EarlyStoppingException
+from training.common import create_env_from_config, create_model_from_config, load_training_state_for_resume, \
+    save_training_state_on_interrupt, save_training_state_on_interrupt_wrapper, save_model_and_state, \
+    load_model_and_state
 
 
-def train_sb3(env, algorithm="SAC", total_timesteps=300000, save_freq=10000):
+def train_single_phase(
+        env_class,
+        config=None,
+        algorithm="SAC",
+        phase=1,
+        total_timesteps=None,
+        log_dir=LOGS_DIR,
+        model_dir=MODELS_DIR,
+        verbose=0,
+        resume=False,
+        total_steps_in_phase=0,
+        max_steps_threshold=70
+):
     """
-    使用Stable Baselines 3训练迷宫环境
-
-    Args:
-        env: 环境实例
-        algorithm: 算法名称，"PPO", "SAC", "A2C"之一
-        total_timesteps: 总训练步数
-        save_freq: 保存模型的频率
-
-    Returns:
-        训练好的模型
+    单个阶段或独立训练智能体的函数，不包含课程学习逻辑
     """
-    print(f"开始使用 {algorithm} 训练迷宫环境...")
+    if config is None:
+        config = TRAINER_CONFIG
 
-    # 包装环境以记录性能
-    env = Monitor(env)
+    seed = config.get("seed", 100)
+    eval_freq = config.get("eval_freq", 5000)
+    performance_thresholds = config.get("performance_thresholds", {})
 
-    # 将环境向量化并标准化奖励
-    env = DummyVecEnv([lambda: env])
-    env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_reward=10.0)
+    # 创建训练和评估环境
+    env = create_env_from_config(env_class, config["env_config"], is_eval=False, verbose=verbose, seed=seed)
+    eval_env = create_env_from_config(env_class, config["env_config"], is_eval=True, verbose=verbose, seed=seed)
 
-    # 选择算法
-    if algorithm == "PPO":
-        model = PPO(
-            "MlpPolicy",
-            env,
-            verbose=1,
-            tensorboard_log=LOGS_DIR,
-            learning_rate=3e-4,
-            n_steps=2048,
-            batch_size=64,
-            n_epochs=10,
-            gamma=0.99,
-            gae_lambda=0.95,
-            clip_range=0.2,
-            ent_coef=0.01,  # 增加熵系数，鼓励探索
-            policy_kwargs=dict(
-                net_arch=[dict(pi=[256, 256], vf=[256, 256])]
-            )
+    # 创建模型
+    model_params = config["model_params"][algorithm]
+    if verbose >= 2:
+        print(f"当前阶段{phase}, 当前学习率为:{model_params['learning_rate']}")
+    model = create_model_from_config(algorithm, env, model_params, seed)
+    if verbose >= 2:
+        print(f"当前阶段{phase}, 模型创建后的学习率为:{model.learning_rate}")
+
+    # 加载模型和状态
+    loaded_steps, model, env = load_model_and_state(
+        model=model,
+        env=env,
+        algorithm=algorithm,
+        phase=phase,
+        model_dir=model_dir,
+        verbose=verbose,
+        resume=resume,
+        state_loader_func=load_training_state_for_resume,
+        default_steps=total_steps_in_phase
+    )
+
+    # 设置总训练步数
+    if total_timesteps is None:
+        base_steps = config.get("timesteps_per_phase", 500000)
+        total_timesteps = base_steps
+
+    # 计算剩余步数
+    remaining_steps = max(0, total_timesteps - loaded_steps) if resume else total_timesteps
+    if verbose >= 1:
+        print(f"训练步数: {remaining_steps} (总计划: {total_timesteps}, 已完成: {loaded_steps})")
+
+    # 创建日志和模型保存路径
+    log_path = os.path.join(log_dir, f"eval_phase{phase}.csv")
+    best_model_path = os.path.join(model_dir, f"{algorithm}_phase{phase}_best")
+    latest_model_path = os.path.join(model_dir, f"{algorithm}_phase{phase}_latest")
+
+    # 创建回调
+    save_log_callback = SaveModelLogCallback(verbose=1)
+    eval_callback = CurriculumEvalCallback(
+        eval_env=eval_env,
+        phase=phase,
+        performance_thresholds=performance_thresholds,
+        callback_on_new_best=save_log_callback,
+        std_threshold_ratio=0.2,
+        n_eval_episodes=20,
+        early_stop_patience=MAX_INT,
+        eval_freq=eval_freq,
+        log_path=log_path,
+        best_model_save_path=best_model_path,
+        deterministic=True,
+        min_delta=1.0,
+        verbose=1,
+        check_direction=True,
+        max_steps_threshold=max_steps_threshold
+    )
+    latest_model_callback = SaveLatestModelCallback(save_path=latest_model_path, save_freq=eval_freq)
+    checkpoint_dir = os.path.join(model_dir, f"checkpoints_phase{phase}")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    checkpoint_callback = SaveCheckpointCallback(algorithm=algorithm, save_dir=checkpoint_dir, max_checkpoints=5)
+    learning_rate_callback = LinearLRDecayCallback(
+        verbose=1, decay_start_step=0, decay_end_step=200000, final_lr_fraction=0.1
+    )
+    reward_callback = RewardMetricsCallback(verbose=1, log_freq=1000)
+
+    all_callbacks = [
+        eval_callback,
+        latest_model_callback,
+        checkpoint_callback,
+        learning_rate_callback,
+        reward_callback
+    ]
+
+    # 恢复学习率衰减回调状态
+    state = load_training_state_for_resume(model_dir, phase, verbose)
+    if state and "lr_decay_callback" in state:
+        lr_state = state["lr_decay_callback"]
+        if hasattr(learning_rate_callback, "n_calls"):
+            learning_rate_callback.n_calls = lr_state["n_calls"]
+        if hasattr(learning_rate_callback, "initial_lr"):
+            learning_rate_callback.initial_lr = lr_state["initial_lr"]
+        if hasattr(learning_rate_callback, "decay_start_step"):
+            learning_rate_callback.decay_start_step = lr_state["decay_start_step"]
+        if hasattr(learning_rate_callback, "decay_end_step"):
+            learning_rate_callback.decay_end_step = lr_state["decay_end_step"]
+        if hasattr(learning_rate_callback, "final_lr_fraction"):
+            learning_rate_callback.final_lr_fraction = lr_state["final_lr_fraction"]
+        if verbose >= 1:
+            print(f"恢复学习率衰减回调状态: 当前步数 {lr_state['n_calls']}")
+
+    # 设置信号处理函数以捕获Ctrl+C
+    def signal_handler(sig, frame):
+        print("\n接收到中断信号(Ctrl+C)，正在保存模型和训练状态...")
+        current_steps = save_training_state_on_interrupt_wrapper(
+            model=model,
+            env=env,
+            algorithm=algorithm,
+            phase=phase,
+            model_dir=model_dir,
+            verbose=verbose,
+            state_saver_func=save_training_state_on_interrupt,
+            callbacks=all_callbacks
         )
-    elif algorithm == "SAC":
-        model = SAC(
-            "MlpPolicy",
-            env,
-            verbose=1,
-            tensorboard_log=LOGS_DIR,
-            learning_rate=3e-4,
-            buffer_size=300000,
-            batch_size=256,
-            tau=0.005,
-            gamma=0.99,
-            train_freq=1,
-            gradient_steps=1,
-            ent_coef="auto",  # 自动调整熵系数
-            learning_starts=5000,  # 增加初始随机探索的步数
-            policy_kwargs=dict(
-                net_arch=[256, 256]
-            )
-        )
-    elif algorithm == "A2C":
-        model = A2C(
-            "MlpPolicy",
-            env,
-            verbose=1,
-            tensorboard_log=LOGS_DIR,
-            learning_rate=7e-4,
-            n_steps=5,
-            gamma=0.99,
-            ent_coef=0.01,
-            policy_kwargs=dict(
-                net_arch=[dict(pi=[64, 64], vf=[64, 64])]
-            )
-        )
-    else:
-        raise ValueError(f"不支持的算法: {algorithm}")
+        print(f"\n模型在第{current_steps}批次处手动停止训练...")
+        exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+    if verbose >= 1:
+        print("已设置Ctrl+C中断处理，训练中按Ctrl+C将保存当前状态")
 
     # 训练模型
     try:
-        # 每save_freq步保存一次模型
-        for i in range(1, total_timesteps + 1, save_freq):
-            model.learn(total_timesteps=min(save_freq, total_timesteps - i + 1),
-                        reset_num_timesteps=False,
-                        tb_log_name=f"{algorithm}")
+        model.learn(
+            total_timesteps=remaining_steps,
+            callback=all_callbacks,
+            tb_log_name=f"{algorithm}_phase{phase}",
+            reset_num_timesteps=not resume
+        )
+    except EarlyStoppingException as e:
+        print(f"早停: {e}")
+        pass
+    except KeyboardInterrupt:
+        print("训练被手动中断(Ctrl+C)，正在保存模型和训练状态...")
+        current_steps = save_training_state_on_interrupt_wrapper(
+            model=model,
+            env=env,
+            algorithm=algorithm,
+            phase=phase,
+            model_dir=model_dir,
+            verbose=verbose,
+            state_saver_func=save_training_state_on_interrupt,
+            callbacks=all_callbacks
+        )
+        return {"phase_complete": False, "total_steps": current_steps}
 
-            # 保存模型
-            model_path = os.path.join(MODELS_DIR, f"{algorithm}_{i}")
-            model.save(model_path)
-            # 同时保存归一化的环境状态
-            env.save(os.path.join(MODELS_DIR, f"vec_normalize_{algorithm}_{i}.pkl"))
-            print(f"模型保存在: {model_path}")
+    # 保存最终模型
+    save_model_and_state(model, env, algorithm, phase, model_dir, suffix="latest", verbose=verbose)
 
-    finally:
-        # 保存最终模型
-        model_path = os.path.join(MODELS_DIR, f"{algorithm}_final")
-        model.save(model_path)
-        # 保存归一化的环境状态
-        env.save(os.path.join(MODELS_DIR, f"vec_normalize_{algorithm}_final.pkl"))
-        print(f"最终模型保存在: {model_path}")
+    # 评估当前性能
+    phase_complete = eval_callback.get_phase_complete()
+    if phase_complete:
+        print(f"阶段{phase}完成! 平均奖励: {eval_callback.last_mean_reward:.2f}")
+    else:
+        print(f"阶段{phase}未完成. 最佳平均奖励: {eval_callback.best_mean_reward:.2f}")
 
-    return model, env
+    # 保存最终模型
+    final_model_path = os.path.join(model_dir, f"{algorithm}_phase{phase}")
+    save_model_and_state(model, env, algorithm, phase, final_model_path, suffix="", verbose=verbose)
+
+    return {"phase_complete": phase_complete, "total_steps": total_timesteps}

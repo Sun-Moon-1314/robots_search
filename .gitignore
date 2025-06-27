@@ -1,2 +1,4 @@
 checkpoints/
 .idea/
+videos/
+maze_search/curriculum_config.py

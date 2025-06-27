@@ -8,4 +8,5 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_DIR = os.path.join(PROJECT_ROOT, 'config')
 ENVS_DIR = os.path.join(PROJECT_ROOT, 'envs')
 TRAINING_DIR = os.path.join(PROJECT_ROOT, 'training')
+CHECKPOINTS_DIR = os.path.join(PROJECT_ROOT, 'checkpoints')
 # ...其他目录

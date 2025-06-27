@@ -4,11 +4,10 @@ import time
 from stable_baselines3.common.env_checker import check_env
 
 from config.maze_search.curriculum_config import create_configurable_curriculum
-from config.maze_search.default_config import ENV_CONFIG, TRAIN_CONFIG
 from envs.pybullet.maze_search import MazeEnv, logger
-from evaluation.evaluator import evaluate_sb3
+from evaluation.evaluator import evaluate_sb3, record_model_video
 from training.curriculum import train_with_curriculum
-from training.trainer import train_sb3
+from training.trainer import train_single_phase
 
 
 def test_environment(render=True, episodes=10, verbose=False):
@@ -69,30 +68,6 @@ def test_environment(render=True, episodes=10, verbose=False):
     logger.info("环境测试完成！")
 
 
-def train_model(algorithm="SAC", timesteps=300000, render=False, verbose=False):
-    """训练模型"""
-    logger.info(f"开始使用 {algorithm} 训练迷宫环境...")
-
-    # 创建环境
-    render_mode = "human" if render else None
-    env = MazeEnv(maze_size=ENV_CONFIG["maze_size"],
-                  render_mode=render_mode,
-                  max_steps=ENV_CONFIG["max_steps"],
-                  verbose=verbose)
-
-    # 训练模型
-    model, _ = train_sb3(env,
-                         algorithm=algorithm,
-                         total_timesteps=timesteps,
-                         save_freq=TRAIN_CONFIG["save_freq"])
-
-    # 关闭环境
-    env.close()
-    logger.info("训练完成！")
-
-    return model
-
-
 def train_curriculum(render=False, resume=False, phase=None, verbose=False):
     """使用课程学习训练模型"""
     logger.info("开始使用课程学习训练迷宫环境...")
@@ -102,6 +77,32 @@ def train_curriculum(render=False, resume=False, phase=None, verbose=False):
 
     # 训练
     results = train_with_curriculum(MazeEnv, curriculum_config, resume=resume, phase_set=phase, verbose=verbose)
+
+    # 打印结果
+    for phase, complete in results.items():
+        logger.info(f"{phase}: {'完成' if complete else '未完成'}")
+
+    logger.info("课程学习训练完成！")
+
+    return results
+
+
+def train_sb3(resume=False, verbose=False):
+    """使用课程学习训练模型"""
+    logger.info("开始使用课程学习训练迷宫环境...")
+
+    # 创建课程学习配置
+    curriculum_config = create_configurable_curriculum()
+
+    # 训练
+    results = train_single_phase(
+        env_class=MazeEnv,
+        config=curriculum_config,
+        algorithm="SAC",
+        phase=1,
+        verbose=verbose,
+        resume=resume
+    )
 
     # 打印结果
     for phase, complete in results.items():
@@ -157,10 +158,8 @@ def main():
     test_parser.add_argument("--verbose", action="store_true", help="显示详细信息")
 
     # 训练命令
-    train_parser = subparsers.add_parser("train", help="训练模型")
-    train_parser.add_argument("--algorithm", type=str, default="SAC", choices=["SAC", "PPO", "A2C"], help="训练算法")
-    train_parser.add_argument("--timesteps", type=int, default=300000, help="训练总步数")
-    train_parser.add_argument("--render", action="store_true", help="启用渲染")
+    train_parser = subparsers.add_parser("train_sb3", help="训练模型")
+    train_parser.add_argument("--resume", action="store_true", help="从已保存的模型继续训练")
     train_parser.add_argument("--verbose", action="store_true", help="显示详细信息")
 
     # 课程学习命令
@@ -178,14 +177,23 @@ def main():
     eval_parser.add_argument("--no-render", action="store_true", help="禁用渲染")
     eval_parser.add_argument("--verbose", action="store_true", help="显示详细信息")
 
+    # 新增: 视频录制命令
+    record_parser = subparsers.add_parser("record", help="录制模型视频")
+    record_parser.add_argument("--model", type=str, required=True, help="模型路径")
+    record_parser.add_argument("--phase", type=int, default=3, help="加载阶段模型")
+    record_parser.add_argument("--episodes", type=int, default=1, help="录制回合数")
+    record_parser.add_argument("--video-length", type=int, default=1000, help="每个视频的最大帧数")
+    record_parser.add_argument("--video-folder", type=str, default="videos", help="视频保存文件夹")
+    record_parser.add_argument("--verbose", action="store_true", help="显示详细信息")
+
     # 解析命令行参数
     args = parser.parse_args()
 
     # 执行相应命令
     if args.command == "test":
         test_environment(render=not args.no_render, episodes=args.episodes, verbose=args.verbose)
-    elif args.command == "train":
-        train_model(algorithm=args.algorithm, timesteps=args.timesteps, render=args.render, verbose=args.verbose)
+    elif args.command == "train_sb3":
+        train_sb3(resume=args.resume, verbose=args.verbose)
     elif args.command == "curriculum":
         train_curriculum(render=args.render, resume=args.resume, phase=args.phase, verbose=args.verbose)
     elif args.command == "eval":
@@ -194,6 +202,18 @@ def main():
                        episodes=args.episodes,
                        render=not args.no_render,
                        verbose=args.verbose)
+    elif args.command == "record":
+        # 新增: 录制视频的函数
+        record_model_video(
+            model_path=args.model,
+            env_class=MazeEnv,
+            curriculum_config=create_configurable_curriculum(),
+            episodes=args.episodes,
+            phase=args.phase,
+            video_length=args.video_length,
+            video_folder=args.video_folder,
+            verbose=args.verbose
+        )
     else:
         parser.print_help()
 

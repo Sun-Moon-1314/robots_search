@@ -10,10 +10,9 @@ import time
 import numpy as np
 from typing import Dict, Any, Optional
 from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
-from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.vec_env import VecEnv, sync_envs_normalization
 from path_config import *
-
+from custom_design.custom_common import get_config
 from evaluation.evaluator import get_base_env
 
 
@@ -23,7 +22,7 @@ class CurriculumEvalCallback(EvalCallback):
     def __init__(
             self,
             eval_env: VecEnv,
-            phase: int,
+            phase: int = 1,
             performance_thresholds: Optional[dict] = None,
             callback_on_new_best: Optional[BaseCallback] = None,
             n_eval_episodes: int = 5,
@@ -40,10 +39,10 @@ class CurriculumEvalCallback(EvalCallback):
             distance_threshold: float = 0.5,
             tilt_threshold: float = 0.3,
             check_direction: bool = False,
-            success_rate_threshold: float = 0.8,
+            success_rate_threshold: float = 0.9,
             success_window_size: int = 5,
             eval_window_size: int = 100,  # 新增参数：评估窗口大小，用于平均值计算
-            step_thresholds: int = 200
+            max_steps_threshold: int = 70,  # 新增参数：成功任务的最大步数阈值
     ):
         super().__init__(
             eval_env=eval_env,
@@ -81,13 +80,13 @@ class CurriculumEvalCallback(EvalCallback):
         self.success_early_stop_count = 0
         # 评估窗口参数
         self.eval_window_size = eval_window_size  # 评估窗口大小，用于平均值计算
+        # 新增：成功任务最大步数阈值
+        self.max_steps_threshold = max_steps_threshold
+        self.adjusted_max_steps_threshold = max_steps_threshold  # 动态调整后的阈值
         # 评估历史
         self.evaluation_history = []
         self.performance_metrics = {}
         self.performance_history = []
-        # 新增：步数阈值相关参数
-        self.step_thresholds = step_thresholds  # 初始化时未设置，动态从环境中获取
-        self.step_threshold_met_count = 0  # 连续满足步数条件的次数
 
     def _check_state_conditions(self) -> bool:
         """检查是否满足状态条件以触发早停"""
@@ -111,7 +110,12 @@ class CurriculumEvalCallback(EvalCallback):
                     self.performance_metrics['movement_alignment'] >= 0.5
             )
 
-        all_conditions_met = distance_ok and tilt_ok and direction_ok
+        steps_ok = (
+                'current_step' in self.performance_metrics and
+                self.performance_metrics['current_step'] <= self.adjusted_max_steps_threshold
+        )
+
+        all_conditions_met = distance_ok and tilt_ok and direction_ok and steps_ok
 
         if self.verbose > 1:
             print(f"早停状态条件检查：")
@@ -122,35 +126,10 @@ class CurriculumEvalCallback(EvalCallback):
             if self.check_direction:
                 print(
                     f"  方向条件: {direction_ok} ({self.performance_metrics.get('movement_alignment', 'N/A'):.2f} >= 0.5)")
+            print(
+                f"  步数条件: {steps_ok} ({self.performance_metrics.get('current_step', 'N/A'):.2f} <= {self.adjusted_max_steps_threshold:.2f})")
 
         return all_conditions_met
-
-    def _check_step_threshold_condition(self) -> bool:
-        """检查是否满足步数阈值条件以触发早停"""
-        if self.step_thresholds is None:
-            if self.verbose > 1:
-                print("步数阈值 step_thresholds 未设置，无法检查步数条件")
-            return False
-
-        if 'current_step' not in self.performance_metrics:
-            if self.verbose > 1:
-                print("性能指标 current_step 未找到，无法检查步数条件")
-            return False
-
-        current_step_avg = self.performance_metrics['current_step']
-        step_condition_met = current_step_avg <= self.step_thresholds
-
-        if step_condition_met:
-            self.step_threshold_met_count += 1
-            if self.verbose > 0:
-                print(f"步数条件满足: {current_step_avg:.2f} <= {self.step_thresholds:.2f}, "
-                      f"连续满足次数: {self.step_threshold_met_count}")
-        else:
-            self.step_threshold_met_count = 0
-            if self.verbose > 0:
-                print(f"步数条件未满足: {current_step_avg:.2f} > {self.step_thresholds:.2f}, 重置计数器")
-
-        return self.step_threshold_met_count >= 3  # 连续3次满足条件才触发早停，可调整
 
     def _check_success_rate_condition(self) -> bool:
         """检查是否满足成功率条件以触发早停，基于窗口内平均值"""
@@ -181,6 +160,17 @@ class CurriculumEvalCallback(EvalCallback):
 
     def _custom_evaluate(self):
         """自定义评估方法，收集性能指标和成功率"""
+        # 动态调整 max_steps_threshold，检查环境中是否有 steps_per_grid 属性
+        if hasattr(self.training_env, 'steps_per_grid'):
+            self.adjusted_max_steps_threshold = min(self.max_steps_threshold, self.training_env.steps_per_grid)
+            if self.verbose > 0:
+                print(
+                    f"动态调整步数阈值: 使用 {self.adjusted_max_steps_threshold} (取 {self.max_steps_threshold} 和环境 steps_per_grid {self.training_env.steps_per_grid} 的最小值)")
+        else:
+            self.adjusted_max_steps_threshold = self.max_steps_threshold
+            if self.verbose > 0:
+                print(f"环境中无 steps_per_grid 属性，使用默认步数阈值: {self.adjusted_max_steps_threshold}")
+
         episode_performance_metrics = {
             "phase": None,
             "current_step": [],
@@ -191,7 +181,6 @@ class CurriculumEvalCallback(EvalCallback):
         }
         episode_rewards, episode_lengths = [], []
         episode_successes = []
-        # eval_env = self.eval_env
         eval_env = self.training_env
         eval_env.reset()
         if hasattr(eval_env, 'prev_angle_diff'):
@@ -248,12 +237,6 @@ class CurriculumEvalCallback(EvalCallback):
                     if hasattr(eval_env, 'prev_angle_diff'):
                         eval_env.prev_angle_diff = angle_diff
 
-                # 检查是否成功
-                current_info = info[0] if isinstance(info, (list, tuple)) and len(info) > 0 else info
-                if isinstance(current_info, dict) and 'success' in current_info:
-                    if current_info['success']:
-                        episode_success = True
-
                 episode_reward += reward[0] if isinstance(reward, (list, tuple, np.ndarray)) else reward
                 episode_length += 1
                 if isinstance(done, (list, tuple, np.ndarray)):
@@ -261,7 +244,35 @@ class CurriculumEvalCallback(EvalCallback):
 
             episode_rewards.append(episode_reward)
             episode_lengths.append(episode_length)
+
+            # 回合结束后，基于平均性能指标判断是否成功
+            avg_metrics = {}
+            for key, values in episode_metrics.items():
+                if values:
+                    avg_metrics[key] = np.mean(values)
+
+            # 成功条件：距离、倾斜角、可选的方向对齐以及步数均满足阈值
+            distance_ok = 'distance_to_target' in avg_metrics and avg_metrics[
+                'distance_to_target'] <= self.distance_threshold
+            tilt_ok = 'tilt_angle' in avg_metrics and avg_metrics['tilt_angle'] <= self.tilt_threshold
+            direction_ok = True
+            if self.check_direction:
+                direction_ok = 'movement_alignment' in avg_metrics and avg_metrics['movement_alignment'] >= 0.5
+            steps_ok = episode_length <= self.adjusted_max_steps_threshold  # 新增步数条件
+
+            episode_success = distance_ok and tilt_ok and direction_ok and steps_ok
             episode_successes.append(episode_success)
+
+            if self.verbose > 1:
+                print(f"回合 {i + 1}/{self.n_eval_episodes} 成功判断：")
+                print(
+                    f"  距离条件: {distance_ok} ({avg_metrics.get('distance_to_target', 'N/A'):.2f} <= {self.distance_threshold:.2f})")
+                print(
+                    f"  倾斜角条件: {tilt_ok} ({avg_metrics.get('tilt_angle', 'N/A'):.2f} <= {self.tilt_threshold:.2f})")
+                if self.check_direction:
+                    print(f"  方向条件: {direction_ok} ({avg_metrics.get('movement_alignment', 'N/A'):.2f} >= 0.5)")
+                print(f"  步数条件: {steps_ok} ({episode_length} <= {self.adjusted_max_steps_threshold})")
+                print(f"  是否成功: {episode_success}")
 
             episode_performance_metrics["phase"] = self.phase
             for key, values in episode_metrics.items():
@@ -359,32 +370,26 @@ class CurriculumEvalCallback(EvalCallback):
                 if self.verbose > 1:
                     print(f"奖励无改进，当前计数: {self.no_improvement_count}/{self.early_stop_patience}")
 
-            # 检查状态条件早停
-            state_conditions_met = self._check_state_conditions()
-
-            # 检查成功率条件早停
+            # 检查成功率条件早停（优先）
             success_rate_met = self._check_success_rate_condition()
 
-            # 新增：检查步数阈值条件早停
-            step_threshold_met = self._check_step_threshold_condition()
+            if success_rate_met:
+                if self.verbose > 0:
+                    print(f"早停触发: 成功率条件连续满足 {self.success_early_stop_count} 次 (>= 3)")
+                self.phase_complete = True
+                return False
 
-            # 综合判断是否早停
+            # 如果成功率未满足，再检查其他条件
+            state_conditions_met = self._check_state_conditions()
+            if state_conditions_met:
+                if self.verbose > 0:
+                    print(f"早停触发: 状态条件满足 (距离, 倾斜角等指标达到阈值)")
+                return False
+
             if self.no_improvement_count >= self.early_stop_patience:
                 if self.verbose > 0:
                     print(
                         f"早停触发: 奖励连续 {self.no_improvement_count} 次评估无改进 (>= {self.early_stop_patience})")
-                return False
-            elif state_conditions_met:
-                if self.verbose > 0:
-                    print(f"早停触发: 状态条件满足 (距离, 倾斜角等指标达到阈值)")
-                return False
-            elif success_rate_met:
-                if self.verbose > 0:
-                    print(f"早停触发: 成功率条件连续满足 {self.success_early_stop_count} 次 (>= 3)")
-                return False
-            elif step_threshold_met:
-                if self.verbose > 0:
-                    print(f"早停触发: 步数条件连续满足 {self.step_threshold_met_count} 次 (>= 3)")
                 return False
 
             # 检查标准差是否满足条件 (奖励稳定性)
@@ -490,7 +495,7 @@ class LinearLRDecayCallback(BaseCallback):
     """
 
     def __init__(self, verbose=0, decay_start_step=0, decay_end_step=None, final_lr_fraction=0.1,
-                 decay_by_time_steps=2000):
+                 decay_by_time_steps=10000):
         """
         参数:
             verbose: 日志详细程度
@@ -510,7 +515,6 @@ class LinearLRDecayCallback(BaseCallback):
         if self.initial_lr is None:
             self.initial_lr = self.model.learning_rate
         self.current_lr = self.initial_lr
-        print(f"初始学习率: {self.initial_lr}")
 
         # 验证模型优化器结构
         if hasattr(self.model, 'policy'):
@@ -533,7 +537,6 @@ class LinearLRDecayCallback(BaseCallback):
                 progress = (self.n_calls - self.decay_start_step) / (self.decay_end_step - self.decay_start_step)
                 # 线性衰减：从初始值到 final_lr_fraction * 初始值
                 current_lr = self.initial_lr * (1 - (1 - self.final_lr_fraction) * progress)
-
                 # 更新PPO优化器
                 if hasattr(self.model, 'policy') and hasattr(self.model.policy, 'optimizer'):
                     for param_group in self.model.policy.optimizer.param_groups:
@@ -559,6 +562,18 @@ class LinearLRDecayCallback(BaseCallback):
                     self.model.logger.record("train/learning_rate", current_lr)
                 if self.model.logger:
                     self.model.logger.record("custom/actual_learning_rate", current_lr)
+
+                # 同步学习率到模型属性
+                if hasattr(self.model, 'learning_rate'):
+                    self.model.learning_rate = current_lr
+
+                # 更新日志值
+                if hasattr(self.model, 'logger') and self.model.logger:
+                    self.model.logger.record("train/learning_rate", current_lr)
+                if self.model.logger:
+                    self.model.logger.record("custom/actual_learning_rate", current_lr)
+
+                self.current_lr = current_lr  # 保存当前学习率到回调实例中
 
         return True
 
@@ -684,9 +699,9 @@ class RewardMetricsCallback(BaseCallback):
 
     def __init__(self,
                  verbose=1,
-                 log_dir=f"{CHECKPOINTS_DIR}/maze_search/tensorboard_logs",
+                 log_dir="path/to/tensorboard_logs",
                  log_freq=1000,  # 降低记录频率
-                 success_distance_threshold=0.5):
+                 check_direction=False):
         """
         初始化回调函数
 
@@ -694,15 +709,12 @@ class RewardMetricsCallback(BaseCallback):
             verbose (int): 日志详细程度
             log_dir (str): TensorBoard日志保存目录
             log_freq (int): 记录日志的频率(步数)
-            success_distance_threshold (float): 认为成功到达目标的距离阈值(米)
+            check_direction (bool): 是否检查方向对齐作为成功条件
         """
         super(RewardMetricsCallback, self).__init__(verbose)
         self.log_dir = log_dir
         self.log_freq = log_freq
-        self.success_distance_threshold = success_distance_threshold
-
-        # 创建日志目录
-        # os.makedirs(self.log_dir, exist_ok=True)
+        self.check_direction = check_direction
 
         # 初始化统计数据
         self.episode_count = 0
@@ -712,7 +724,12 @@ class RewardMetricsCallback(BaseCallback):
         # 成功率统计
         self.total_attempts = 0
         self.total_successes = 0
+        self.success_history = []  # 记录每个回合是否成功
+        self.success_window_size = 100  # 成功率计算窗口大小
+        self.success_rate = 0.0
 
+        # 当前步数
+        self.current_steps = 0
         # 当前episode的关键指标
         self.current_distance = None
         self.current_tilt = None
@@ -737,6 +754,11 @@ class RewardMetricsCallback(BaseCallback):
         # 小球位置 - 现在保存初始位置
         self.initial_ball_position = None
         self.current_ball_position = None
+
+        # 当前回合的指标列表，用于计算平均值
+        self.episode_distances = []
+        self.episode_tilts = []
+        self.episode_movement_consistencies = []
 
         # 定义倾斜状态描述
         self.tilt_descriptions = {
@@ -769,49 +791,50 @@ class RewardMetricsCallback(BaseCallback):
             (-1.0, -0.8): "高度不一致"
         }
 
-    def _on_training_start(self) -> None:
-        """在训练开始时调用，设置TensorBoard记录器"""
-        # 保留所有输出格式，包括 HumanOutputFormat
-        for fmt in self.logger.output_formats:
-            if "TensorBoardOutputFormat" in str(type(fmt)):
-                self.tb_formatter = fmt.writer
-                break
-
-    def _get_tilt_description(self, tilt_degrees):
-        """根据倾斜角度返回描述性文本"""
-        for (lower, upper), desc in self.tilt_descriptions.items():
-            if lower <= tilt_degrees < upper:
-                return desc
-        return "未知状态"
-
-    def _get_tracking_description(self, tracking_score):
-        """根据跟踪分数返回描述性文本"""
-        for (lower, upper), desc in self.tracking_descriptions.items():
-            if lower <= tracking_score < upper:
-                return desc
-        return "未知状态"
-
-    def _get_consistency_description(self, consistency_score):
-        """根据移动一致性分数返回描述性文本"""
-        for (lower, upper), desc in self.consistency_descriptions.items():
-            if lower <= consistency_score < upper:
-                return desc
-        return "未知状态"
+        # 成功条件阈值，将在 _on_step 中动态更新
+        self.success_distance_threshold = 0.5
+        self.success_tilt_threshold = 0.3
+        self.max_steps_threshold = 70
+        self.adjusted_max_steps_threshold = self.max_steps_threshold
 
     def _on_step(self) -> bool:
         """每步调用的方法"""
-        # 获取当前观察
+        # 获取当前环境
         env_ = self.training_env
         env = get_base_env(env_)
 
-        # 直接从环境中获取原始观察值
+        # 获取当前课程阶段
+        current_phase = getattr(env, 'curriculum_phase', 1)
+
+        # 动态加载配置和成功条件阈值
+        try:
+            env_config = getattr(env, 'env_config', None)
+            if env_config and 'performance_thresholds' in env_config:
+                perf_thresholds = env_config['performance_thresholds']
+                self.success_distance_threshold = perf_thresholds.get('distance_to_target', 0.5)
+                self.success_tilt_threshold = perf_thresholds.get('tilt_angle', 0.3)
+                self.max_steps_threshold = perf_thresholds.get('max_steps', 70)
+            else:
+                # 如果环境中没有配置，回退到默认值或配置文件
+                config = get_config(current_phase)
+                if 'performance_thresholds' in config:
+                    perf_thresholds = config['performance_thresholds']
+                    self.success_distance_threshold = perf_thresholds.get('distance_to_target', 0.5)
+                    self.success_tilt_threshold = perf_thresholds.get('tilt_angle', 0.3)
+                    self.max_steps_threshold = perf_thresholds.get('max_steps', 70)
+        except Exception as e:
+            if self.verbose > 0:
+                print(f"加载配置失败，使用默认阈值: {e}")
+
+        # 获取当前观察值
         if hasattr(env, 'get_raw_obs'):
             obs = env.get_raw_obs()  # 获取原始观察值
             obs = np.round(obs, decimals=6)
         else:
             # 如果环境不支持 get_raw_obs，回退到默认逻辑
             obs_normalized = self.locals.get('new_obs')[0]
-            print(f"警告：环境不支持 get_raw_obs，使用归一化数据: {obs_normalized}")
+            if self.verbose > 0:
+                print(f"警告：环境不支持 get_raw_obs，使用归一化数据: {obs_normalized}")
             if hasattr(self.training_env, 'obs_rms'):
                 mean = self.training_env.obs_rms.mean
                 var = self.training_env.obs_rms.var
@@ -823,6 +846,19 @@ class RewardMetricsCallback(BaseCallback):
                 obs = obs_normalized
 
         self.current_episode_length += 1
+        self.current_steps = self.current_episode_length
+        # 尝试从环境中获取步数信息
+        try:
+            if hasattr(env, 'get_performance_metrics'):
+                metrics = env.get_performance_metrics()
+                if 'max_steps' in metrics:
+                    self.current_steps = metrics.get('current_step', self.current_steps)
+            elif hasattr(env, 'current_step'):
+                self.current_steps = env.current_step
+        except Exception as e:
+            if self.verbose > 0:
+                print(f"获取步数信息失败: {e}，使用默认步数 {self.current_steps}")
+
         # 提取关键指标 - 适配28维观察空间
         if len(obs) == 28:  # 确保观察空间维度正确
             # 提取机器人位置和朝向 (索引0-2)
@@ -834,6 +870,7 @@ class RewardMetricsCallback(BaseCallback):
             dx, dy = obs[3], obs[4]
             self.current_distance = np.sqrt(dx ** 2 + dy ** 2)  # 计算到球的距离
             self.current_ball_position = (dx, dy)
+            self.episode_distances.append(self.current_distance)  # 记录到回合列表中
 
             # 提取平衡状态 (索引5-8)
             roll, pitch = obs[5], obs[6]
@@ -843,6 +880,8 @@ class RewardMetricsCallback(BaseCallback):
             self.current_roll_rate = roll_rate
             self.current_pitch_rate = pitch_rate
             self.current_tilt = np.sqrt(roll ** 2 + pitch ** 2)  # 计算倾斜角度
+            self.episode_tilts.append(self.current_tilt)  # 记录到回合列表中
+
             # 计算机器人朝向与目标方向的角度差
             target_angle = np.arctan2(dy, dx)
             angle_diff = np.arctan2(np.sin(target_angle - yaw), np.cos(target_angle - yaw))
@@ -885,12 +924,14 @@ class RewardMetricsCallback(BaseCallback):
             self.current_forward_speed = obs[25]  # 前进速度
             self.current_lateral_speed = obs[26]  # 侧向速度
             self.current_movement_consistency = obs[27]  # 移动一致性
+            self.episode_movement_consistencies.append(self.current_movement_consistency)  # 记录到回合列表中
 
         # 检查episode是否结束
         done = env.get_done()
         # 每隔 log_freq 步记录一次数据到 TensorBoard，且确保不是 episode 的第一步
         if (self.log_freq is not None
-                and self.num_timesteps % self.log_freq == 0 and self.current_distance < 1.0):
+                and self.num_timesteps % self.log_freq == 0 and self.current_distance is not None
+                and self.current_distance < 1.0):
             # 检查关键指标中为 0 的数量
             zero_count = 0
             key_metrics = [
@@ -958,26 +999,75 @@ class RewardMetricsCallback(BaseCallback):
             if self.current_movement_consistency is not None:
                 self.logger.record("metrics/movement_consistency", self.current_movement_consistency)
 
+            # 记录当前步数
+            self.logger.record("metrics/current_steps", self.current_steps)
             # 记录成功率
-            if self.total_attempts > 0:
-                success_rate = self.total_successes / self.total_attempts
-                self.logger.record("metrics/success_rate", success_rate)
-
+            self.logger.record("metrics/success_rate", self.success_rate)
             # 写入数据到 TensorBoard
             self.logger.dump(self.num_timesteps)
 
-        # 只有在 episode 结束时才重置相关变量
+        # 只有在 episode 结束时才重置相关变量并判断成功率
         if done:
-            self.current_episode_length = 0
+            self.total_attempts += 1
             self.episode_count += 1
+
+            # 动态调整 max_steps_threshold，检查环境中是否有 steps_per_grid 属性
+            if hasattr(env, 'steps_per_grid'):
+                self.adjusted_max_steps_threshold = min(self.max_steps_threshold, env.steps_per_grid)
+                if self.verbose > 0 and self.episode_count % self.episode_log_freq == 0:
+                    print(
+                        f"动态调整步数阈值: 使用 {self.adjusted_max_steps_threshold} (取 {self.max_steps_threshold} 和环境 steps_per_grid {env.steps_per_grid} 的最小值)")
+            else:
+                self.adjusted_max_steps_threshold = self.max_steps_threshold
+                if self.verbose > 0 and self.episode_count % self.episode_log_freq == 0:
+                    print(f"环境中无 steps_per_grid 属性，使用默认步数阈值: {self.adjusted_max_steps_threshold}")
+
+            # 计算回合的平均指标
+            avg_distance = np.mean(self.episode_distances) if self.episode_distances else float('inf')
+            avg_tilt = np.mean(self.episode_tilts) if self.episode_tilts else float('inf')
+            avg_movement_consistency = np.mean(
+                self.episode_movement_consistencies) if self.episode_movement_consistencies else 0.0
+
+            # 判断是否成功
+            distance_ok = avg_distance <= self.success_distance_threshold
+            tilt_ok = avg_tilt <= self.success_tilt_threshold
+            direction_ok = True
+            if self.check_direction:
+                direction_ok = avg_movement_consistency >= 0.5
+            steps_ok = self.current_steps <= self.adjusted_max_steps_threshold  # 新增步数条件
+
+            episode_success = distance_ok and tilt_ok and direction_ok and steps_ok
+            if episode_success:
+                self.total_successes += 1
+
+            # 更新成功历史记录
+            self.success_history.append(episode_success)
+            if len(self.success_history) > self.success_window_size:
+                self.success_history = self.success_history[-self.success_window_size:]
+
+            # 计算成功率
+            total_episodes = len(self.success_history)
+            successful_episodes = sum(self.success_history)
+            self.success_rate = successful_episodes / total_episodes if total_episodes > 0 else 0.0
+
+            # 记录成功率和判断结果
+            if self.verbose > 0 and self.episode_count % self.episode_log_freq == 0:
+                print(
+                    f"回合 {self.episode_count} 结束，成功率: {self.success_rate:.2%} ({successful_episodes}/{total_episodes})")
+                print(f"成功条件检查：")
+                print(f"  距离条件: {distance_ok} ({avg_distance:.2f} <= {self.success_distance_threshold:.2f})")
+                print(f"  倾斜角条件: {tilt_ok} ({avg_tilt:.2f} <= {self.success_tilt_threshold:.2f})")
+                if self.check_direction:
+                    print(f"  方向条件: {direction_ok} ({avg_movement_consistency:.2f} >= 0.5)")
+                print(f"  步数条件: {steps_ok} ({self.current_steps} <= {self.adjusted_max_steps_threshold})")
+                print(f"  是否成功: {episode_success}")
+
+            # 重置回合相关变量
+            self.current_episode_length = 0
             self.initial_ball_position = None  # 重置初始位置，为下一个 episode 做准备
             self.prev_angle_diff = None  # 重置上一步角度差
+            self.episode_distances = []  # 重置回合指标列表
+            self.episode_tilts = []
+            self.episode_movement_consistencies = []
 
         return True
-
-    @staticmethod
-    def _get_direction_from_yaw(yaw_deg):
-        """将偏航角度转换为方向描述"""
-        directions = ["北", "东北", "东", "东南", "南", "西南", "西", "西北"]
-        index = round(yaw_deg / 45) % 8
-        return directions[index]

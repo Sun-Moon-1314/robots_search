@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 @File    : curriculum_config.py
 @Author  : zhangjian
@@ -134,21 +133,20 @@ DEFAULT_CURRICULUM = {
 TRAINER_CONFIG = {
     "name": "轮式机器人自主搜索",
     "algorithm": "SAC",
-    "timesteps_per_phase": 1000000,
-    "eval_freq": 10000,
+    "timesteps_per_phase": 500000,
+    "eval_freq": 5000,
     "env_config": {
         "maze_size": (7, 7),
         "curriculum_phase": 1,
         "random_positions": [(2, 1)],
         "ball_pos": None,
         "goal_pos": None,
-        "max_tilt_angle": 0.4,  # 约40度，初始阶段允许较大倾斜
-        "max_expected_change": 0.2
+        "max_tilt_angle": 0.4  # 约40度，初始阶段允许较大倾斜
     },
     "model_params": {
         "SAC": {
-            "learning_rate": 5e-4,
-            "buffer_size": 300000,
+            "learning_rate": 1e-4,
+            "buffer_size": 150000,
             "batch_size": 256,
             "ent_coef": "auto",
             "learning_starts": 1000,
@@ -165,7 +163,7 @@ TRAINER_CONFIG = {
     "seed": 100,
     "performance_thresholds": {
         "tilt_angle": 0.4,  # 最大倾斜角度阈值（弧度），对应奖励函数中的tilt_angle
-        "distance_to_target": 0.4,  # 最大距离误差阈值（米），对应奖励函数中的distance_to_ball
+        "distance_to_target": 0.5,  # 最大距离误差阈值（米），对应奖励函数中的distance_to_ball
         "movement_alignment": 0.8  # 移动方向与朝向的一致性阈值，对应奖励函数中的movement_alignment
     }
 }
@@ -206,7 +204,7 @@ def get_reward_config(curriculum_phase):
         # 奖励权重 - 使用1-10的整数范围
         'weights': {
             'distance': 0,
-            'balance_fallen': 0,
+            'balance': 0,
             'velocity': 0,
             'fallen': 0,  # 摔倒惩罚
             'tilt_near_target': 0,
@@ -220,8 +218,9 @@ def get_reward_config(curriculum_phase):
         # 奖励开关
         'enable': {
             'distance': False,  # 默认全部关闭，根据阶段开启
-            'balance_fallen': False,
+            'balance': False,
             'velocity': False,
+            'fallen': False,
             'tilt_near_target': False,
             'direction_exploration': False,
             'target_detection': False,
@@ -230,17 +229,18 @@ def get_reward_config(curriculum_phase):
         },
         # 阈值设置
         'thresholds': {
-            'close': 0.4,  # 接近目标阈值(米)：机器人与目标距离小于此值算接近。值越大，判定越宽松；值越小，要求更近。
-            'fallen': 0.5,  # 摔倒阈值(弧度)：倾斜角度超此值算摔倒。值越大，越不容易摔倒；值越小，越容易摔倒。
-            'warning': 0.3,  # 摔倒预警阈值(弧度)：接近摔倒时的警告角度。值越大，预警越早；值越小，预警越晚。
-            'tilt_threshold': 0.1,  # 倾斜阈值(弧度)：特定场景倾斜惩罚阈值。值越大，容忍度越高；值越小，容忍度越低。
-            'angle_threshold': 0.1,  # 侧面目标角度阈值(弧度)：目标偏离朝向的判定角度。值越大，范围越宽；值越小，要求更正对。
-            'max_angle_reward': 0.6,  # 最大角度奖励：方向调整的最大奖励值。值越大，奖励上限越高；值越小，奖励上限越低。
-            'angle_reward_factor': 3.0,  # 角度变化奖励因子：放大角度变化的奖励影响。值越大，影响越强；值越小，影响越弱。
-            'direction_exploration_scale': 1.0,  # 方向探索缩放系数：调整方向探索奖励幅度。值越大，奖励越强；值越小，奖励越弱。
-            'max_rate': 5.0  # 角速度最大值(弧度/秒)：归一化角速度的参考值。值越大，敏感度越低；值越小，敏感度越高。
-
+            'close': 0.0,  # 接近目标阈值(米)
+            'fallen': 0.0,  # 摔倒阈值(弧度)
+            'warning': 0.0,  # 摔倒预警阈值(弧度)
+            'near_target': 0.0,  # "接近"阈值(米)
+            'tilt_threshold': 0.0,  # 倾斜阈值(弧度)
+            'angle_threshold': 0.0,  # 侧面目标角度阈值(弧度)
+            'max_angle_reward': 0.0,  # 最大角度奖励
+            'angle_reward_factor': 0.0,  # 角度变化奖励因子
+            'direction_exploration_scale': 0.0,  # 方向探索缩放系数
+            'max_rate': 0.0  # 角速度最大值，用于归一化
         }
+
     }
 
     # 根据课程阶段设置具体参数
@@ -248,7 +248,8 @@ def get_reward_config(curriculum_phase):
         # 开启所有奖励组件
         config['enable'].update({
             'distance': True,  # 距离目标
-            'balance_fallen': True,  # 平衡
+            'balance': True,  # 平衡
+            'fallen': True,  # 摔倒惩罚
             'velocity': True,  # 速度
             'direction_exploration': True,  # 方向探索
             'target_detection': True,  # 目标检测
@@ -259,16 +260,16 @@ def get_reward_config(curriculum_phase):
 
         # 设置权重 (1-10范围)，均衡分配，稍微偏向核心目标
         config['weights'].update({
-            'distance': 7,  # 距离目标较重要
-            'balance_fallen': 5,  # 平衡重要
-            'fallen': 4,  # 摔倒惩罚重要
-            'velocity': 2,  # 速度奖励
-            'direction_exploration': 3,  # 方向探索
-            'target_detection': 2,  # 目标检测
-            'target_tracking': 1,  # 目标跟踪
-            'tilt_near_target': 5,  # 接近目标时的平衡
-            'step_penalty': 2  # 步数惩罚
+            'distance': 0,  # 距离目标较重要
+            'balance': 0,  # 平衡重要
+            'fallen': 0,  # 摔倒惩罚重要
+            'velocity': 0,  # 速度奖励
+            'direction_exploration': 0,  # 方向探索
+            'target_detection': 0,  # 目标检测
+            'target_tracking': 0,  # 目标跟踪
+            'tilt_near_target': 0,  # 接近目标时的平衡
+            'step_penalty': 0  # 步数惩罚
         })
-        config['reward_penalty_factor'] = 0.6  # 平衡奖励和惩罚
+        config['reward_penalty_factor'] = 0.5  # 平衡奖励和惩罚
 
     return config

@@ -5,316 +5,20 @@
 @Desc    : 课程学习实现
 """
 
-import os
 import random
-from copy import deepcopy
-import copy
-import numpy as np
-import pickle
-import time
-import datetime
-from stable_baselines3 import PPO, SAC, HerReplayBuffer
-from stable_baselines3.common.evaluation import evaluate_policy
-from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
-from torch.backends.mkl import verbose
+from graphene.types.scalars import MAX_INT
 
 from config.maze_search.default_config import MODELS_DIR, LOGS_DIR
-from evaluation.evaluator import evaluate_model
-from training.curriculum_callbacks import *
+from training.common import load_training_state, create_env_from_config, create_model_from_config, save_training_state
+from training.callbacks import *
 
 # 创建保存最佳模型的目录
 best_model_dir = os.path.join(MODELS_DIR, f"best_models")
 os.makedirs(best_model_dir, exist_ok=True)
 
 
-def create_env_from_config(env_class, env_config, is_eval=False, verbose=False):
-    """
-    根据配置创建环境
-
-    Args:
-        env_class: 环境类
-        env_config: 环境配置字典
-        is_eval: 是否为评估环境
-        verbose:
-    Returns:
-        创建好的环境
-
-    """
-    # 复制配置以避免修改原始配置
-    env_config = deepcopy(env_config)
-
-    # 创建基础环境
-    # 创建环境时传递完整的env_config
-    env = env_class(
-        maze_size=env_config.get("maze_size", (7, 7)),
-        verbose=verbose,  # 可以根据需要调整
-        env_config=env_config,  # 传递完整配置
-        is_eval=is_eval
-    )
-
-    # 设置课程阶段
-    env.curriculum_phase = env_config.get("curriculum_phase", 1)
-
-    # 包装环境
-    env = Monitor(env)  # 返回真实奖励
-    env = DummyVecEnv([lambda: env])
-
-    # 关键修改：确保训练和评估使用相同的归一化统计数据
-    env = VecNormalize(
-        env,
-        norm_obs=True,
-        norm_reward=True,
-        clip_obs=10.,
-        clip_reward=10.,
-        gamma=0.99,
-        training=not is_eval  # 评估时不更新统计数据
-    )
-
-    return env
-
-
-def create_model_from_config(algorithm, env, model_params):
-    """
-    根据配置创建模型
-
-    Args:
-        algorithm: 算法名称 ("SAC" 或 "PPO")
-        env: 训练环境
-        model_params: 模型参数字典
-
-    Returns:
-        创建好的模型
-    """
-    if algorithm == "SAC":
-        model = SAC("MlpPolicy", env, verbose=1, tensorboard_log=LOGS_DIR, **model_params)
-    elif algorithm == "PPO":
-        model = PPO("MlpPolicy", env, verbose=1, tensorboard_log=LOGS_DIR, **model_params)
-    else:
-        raise ValueError(f"不支持的算法: {algorithm}")
-
-    return model
-
-
-def save_training_state(algorithm, phase_complete, phase, timesteps_per_phase, model=None, env=None, total_steps=0,
-                        attempt=0, phase_config=None):
-    """
-    保存训练状态到文件，包含更多训练参数并保存模型、环境和经验回放池
-
-    Args:
-        algorithm: 算法名称
-        phase_complete: 各阶段完成状态字典
-        phase: 当前训练阶段
-        timesteps_per_phase: 当前阶段的总训练步数设置
-        model: 当前训练模型 (可选)
-        env: 当前训练环境 (可选)
-        total_steps: 当前阶段已完成的步数 (可选)
-        attempt: 当前阶段的尝试次数 (可选)
-        phase_config: 当前阶段的配置 (可选)
-    """
-    state_dir = os.path.join(MODELS_DIR, "states")
-    os.makedirs(state_dir, exist_ok=True)
-
-    # 基本训练状态
-    state = {
-        "phase_complete": phase_complete,
-        "current_phase": phase,
-        "timesteps_per_phase": timesteps_per_phase,
-        "total_steps_in_phase": total_steps,
-        "attempt": attempt,  # 添加尝试次数
-        "save_time": {
-            "timestamp": time.time(),
-            "datetime": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-    }
-
-    # 添加模型参数
-    if model is not None:
-        # 获取模型的学习率
-        if hasattr(model, "learning_rate"):
-            state["learning_rate"] = model.learning_rate
-        # elif hasattr(model, "lr_schedule") and callable(model.lr_schedule):
-        #     state["learning_rate"] = model.lr_schedule(total_steps)
-
-        # 获取其他训练参数
-        if algorithm == "PPO" and hasattr(model, "clip_range"):
-            state["clip_range"] = model.clip_range
-            if hasattr(model, "ent_coef"):
-                state["ent_coef"] = model.ent_coef
-            if hasattr(model, "vf_coef"):
-                state["vf_coef"] = model.vf_coef
-            if hasattr(model, "gamma"):
-                state["gamma"] = model.gamma
-            if hasattr(model, "gae_lambda"):
-                state["gae_lambda"] = model.gae_lambda
-            if hasattr(model, "n_steps"):
-                state["n_steps"] = model.n_steps
-            if hasattr(model, "n_epochs"):
-                state["n_epochs"] = model.n_epochs
-        elif algorithm == "SAC":
-            if hasattr(model, "gamma"):
-                state["gamma"] = model.gamma
-            if hasattr(model, "tau"):
-                state["tau"] = model.tau
-            if hasattr(model, "buffer_size"):
-                state["buffer_size"] = model.buffer_size
-            if hasattr(model, "batch_size"):
-                state["batch_size"] = model.batch_size
-            if hasattr(model, "ent_coef"):
-                state["ent_coef"] = model.ent_coef
-
-        # 保存模型
-        model_path = os.path.join(state_dir, f"{algorithm}_phase{phase}_state_model")
-        model.save(model_path)
-        state["model_path"] = model_path
-        print(f"模型已保存: {model_path}.zip")
-
-        # 保存经验回放池（如果模型有）
-        if hasattr(model, "replay_buffer"):
-            replay_buffer_path = os.path.join(state_dir, f"{algorithm}_phase{phase}_state_replay_buffer.pkl")
-            try:
-                model.save_replay_buffer(replay_buffer_path)
-                state["replay_buffer_path"] = replay_buffer_path
-                print(f"经验回放池已保存: {replay_buffer_path}")
-            except Exception as e:
-                print(f"保存经验回放池失败: {e}")
-
-    # 添加环境参数并保存环境状态
-    if env is not None:
-        if hasattr(env, "norm_reward") and hasattr(env, "norm_obs"):
-            state["env_normalization"] = {
-                "norm_obs": env.norm_obs,
-                "norm_reward": env.norm_reward
-            }
-            if hasattr(env, "clip_obs"):
-                state["env_normalization"]["clip_obs"] = env.clip_obs
-            if hasattr(env, "clip_reward"):
-                state["env_normalization"]["clip_reward"] = env.clip_reward
-            if hasattr(env, "gamma"):
-                state["env_normalization"]["gamma"] = env.gamma
-
-        # 保存环境状态（如果是VecNormalize环境）
-        if hasattr(env, "save"):
-            env_path = os.path.join(state_dir, f"{algorithm}_phase{phase}_state_env.pkl")
-            try:
-                env.save(env_path)
-                state["env_state_path"] = env_path
-                print(f"环境状态已保存: {env_path}")
-            except Exception as e:
-                print(f"保存环境状态失败: {e}")
-
-    # 保存随机数生成器状态
-    random_state = {
-        "numpy": np.random.get_state(),
-        "python": random.getstate()
-    }
-
-    # 如果使用PyTorch，也保存其随机数状态
-    try:
-        import torch
-        random_state["torch"] = torch.get_rng_state()
-        if torch.cuda.is_available():
-            random_state["torch_cuda"] = torch.cuda.get_rng_state_all()
-    except ImportError:
-        pass
-    except Exception as e:
-        print(f"保存PyTorch随机数状态失败: {e}")
-
-    state["random_state"] = random_state
-
-    # 添加阶段配置信息
-    if phase_config is not None:
-        state["phase_config"] = {
-            "name": phase_config.get("name", f"Phase {phase}"),
-            "reward_threshold": phase_config.get("reward_threshold", 0),
-            "env_config": phase_config.get("env_config", {}),
-            "max_attempts": phase_config.get("max_attempts", 3),  # 添加最大尝试次数
-            "step_increase_factor": phase_config.get("step_increase_factor", 1.5)  # 添加步数增加因子
-        }
-        # 添加模型参数，但排除不可序列化的对象
-        if "model_params" in phase_config:
-            model_params = {}
-            for algo, params in phase_config["model_params"].items():
-                model_params[algo] = {}
-                for key, value in params.items():
-                    if isinstance(value, (int, float, str, bool, list, dict, tuple)) or value is None:
-                        model_params[algo][key] = value
-            state["phase_config"]["model_params"] = model_params
-
-    state_path = os.path.join(state_dir, f"{algorithm}_training_state.pkl")
-    with open(state_path, "wb") as f:
-        pickle.dump(state, f)
-    print(f"训练状态已保存: {state_path}")
-    return state
-
-
-def load_training_state(algorithm, total_phases):
-    """从文件加载训练状态"""
-    state_path = os.path.join(MODELS_DIR, "states", f"{algorithm}_training_state.pkl")
-    if os.path.exists(state_path):
-        try:
-            with open(state_path, "rb") as f:
-                state = pickle.load(f)
-
-            # 打印加载的状态信息
-            print(f"已加载训练状态: {state_path}")
-            if "save_time" in state:
-                print(f"  - 保存时间: {state['save_time'].get('datetime', '未知')}")
-            print(f"  - 当前阶段: {state.get('current_phase', '未知')}")
-
-            if "learning_rate" in state:
-                print(f"  - 学习率: {state['learning_rate']}")
-
-            if "total_steps_in_phase" in state:
-                print(f"  - 当前阶段已完成步数: {state['total_steps_in_phase']}")
-
-            phase_complete = state.get("phase_complete", {})
-            for phase, completed in sorted(phase_complete.items()):
-                status = "已完成" if completed else "未完成"
-                print(f"  - 阶段{phase}: {status}")
-
-            # 检查模型和环境文件是否存在
-            if "model_path" in state:
-                model_file = f"{state['model_path']}.zip"
-                if os.path.exists(model_file):
-                    print(f"  - 模型文件: {model_file} (存在)")
-                else:
-                    print(f"  - 模型文件: {model_file} (不存在)")
-
-            if "env_state_path" in state:
-                if os.path.exists(state["env_state_path"]):
-                    print(f"  - 环境状态文件: {state['env_state_path']} (存在)")
-                else:
-                    print(f"  - 环境状态文件: {state['env_state_path']} (不存在)")
-
-            if "replay_buffer_path" in state:
-                if os.path.exists(state["replay_buffer_path"]):
-                    print(f"  - 经验回放池文件: {state['replay_buffer_path']} (存在)")
-                else:
-                    print(f"  - 经验回放池文件: {state['replay_buffer_path']} (不存在)")
-
-            return state
-        except Exception as e:
-            print(f"加载训练状态失败: {e}")
-            return {
-                "phase_complete": {i: False for i in range(1, total_phases + 1)},
-                "current_phase": 1,
-                "timesteps_per_phase": None,
-                "total_steps_in_phase": 0,
-                "attempt": 0
-            }
-    else:
-        print(f"未找到训练状态文件: {state_path}")
-        return {
-            "phase_complete": {i: False for i in range(1, total_phases + 1)},
-            "current_phase": 1,
-            "timesteps_per_phase": None,
-            "total_steps_in_phase": 0,
-            "attempt": 0
-        }
-
-
-def resume_processor(resume, phase, start_phase, total_phases, model, model_params, env, algorithm, phase_set, phase_config):
+def resume_processor(resume, phase, start_phase, total_phases, model, model_params, env, algorithm, phase_set,
+                     phase_config):
     """
     断点恢复处理
     :param resume:
@@ -338,7 +42,6 @@ def resume_processor(resume, phase, start_phase, total_phases, model, model_para
                 # 使用load方法加载模型，但保留当前阶段的学习率设置
                 model = type(model).load(state["model_path"], env=env)
 
-                # 更新模型的学习率为当前阶段配置的学习率
                 # 更新模型的学习率为当前阶段配置的学习率
                 new_lr = model_params["learning_rate"]
 
@@ -368,7 +71,7 @@ def resume_processor(resume, phase, start_phase, total_phases, model, model_para
 
                 print("模型加载成功")
 
-                # 恢复环境状态（如果有）
+                # 尝试恢复环境状态（如果有），但不强制要求
                 if "env_state_path" in state and state["env_state_path"] and os.path.exists(
                         state["env_state_path"]):
                     try:
@@ -380,7 +83,7 @@ def resume_processor(resume, phase, start_phase, total_phases, model, model_para
                             env.load(state["env_state_path"])
                             print(f"已加载环境状态: {state['env_state_path']}")
                     except Exception as e:
-                        print(f"加载环境状态失败: {e}")
+                        print(f"加载环境状态失败，但继续训练: {e}")
 
                 # 恢复经验回放池（如果有）
                 if "replay_buffer_path" in state and state["replay_buffer_path"] and os.path.exists(
@@ -394,28 +97,27 @@ def resume_processor(resume, phase, start_phase, total_phases, model, model_para
                 print(f"从训练状态加载模型失败: {e}，尝试其他模型加载方式")
                 # 如果加载失败，继续尝试其他加载方式
 
-        # 如果没有找到训练状态中的模型或加载失败，则按原来的逻辑尝试加载
+        # 如果没有找到训练状态中的模型或加载失败，则按新的优先级尝试加载
         if not ("model_path" in state and os.path.exists(f"{state['model_path']}.zip")):
-            latest_path = os.path.join(MODELS_DIR, f"{algorithm}_phase{phase}_latest")
-            best_path = os.path.join(MODELS_DIR, f"{algorithm}_phase{phase}_best")
+            # 修改加载优先级：先尝试加载phase模型，再尝试加载best模型，不加载latest模型
             phase_path = os.path.join(MODELS_DIR, f"{algorithm}_phase{phase}")
+            best_path = os.path.join(MODELS_DIR, f"best_model")
 
             # 处理强制跳过阶段的情况
             if phase_set is not None and phase == start_phase:
                 # 尝试加载前一阶段的模型作为起点
                 prev_phase_path = os.path.join(MODELS_DIR, f"{algorithm}_phase{phase_set}")
-                prev_best_path = os.path.join(MODELS_DIR, f"{algorithm}_phase{phase_set}_best")
-                prev_latest_path = os.path.join(MODELS_DIR, f"{algorithm}_phase{phase_set}_latest")
+                prev_best_path = os.path.join(MODELS_DIR, f"best_model")
 
-                # 按优先级尝试加载前一阶段的各种模型
+                # 按新的优先级尝试加载前一阶段的模型
                 model_loaded = False
                 for path_name, path in [
-                    ("最佳模型", prev_best_path),
-                    ("最新模型", prev_latest_path),
-                    ("完成模型", prev_phase_path)
+                    ("完成模型", prev_phase_path),
+                    ("最佳模型", prev_best_path)
                 ]:
                     if os.path.exists(f"{path}.zip"):
                         print(f"强制跳过：从阶段{phase_set}的{path_name}加载")
+                        print(f"加载目录为:{path}.zip")
                         model = type(model).load(path, env=env)
 
                         # 更新模型的学习率为当前阶段配置的学习率
@@ -445,7 +147,7 @@ def resume_processor(resume, phase, start_phase, total_phases, model, model_para
                             for param_group in model.ent_coef_optimizer.param_groups:
                                 param_group['lr'] = new_lr
 
-                        # 尝试加载对应的环境归一化状态
+                        # 尝试加载对应的环境归一化状态，但不强制要求
                         vec_norm_path = f"{path}_vecnorm.pkl"
                         if os.path.exists(vec_norm_path):
                             try:
@@ -453,7 +155,7 @@ def resume_processor(resume, phase, start_phase, total_phases, model, model_para
                                 env = VecNormalize.load(vec_norm_path, env)
                                 print(f"已加载环境归一化状态: {vec_norm_path}")
                             except Exception as e:
-                                print(f"加载环境归一化状态失败: {e}")
+                                print(f"加载环境归一化状态失败，但继续训练: {e}")
                         model_loaded = True
                         break
 
@@ -498,7 +200,7 @@ def resume_processor(resume, phase, start_phase, total_phases, model, model_para
                             for param_group in model.ent_coef_optimizer.param_groups:
                                 param_group['lr'] = new_lr
 
-                        # 尝试加载对应的环境归一化状态
+                        # 尝试加载对应的环境归一化状态，但不强制要求
                         vec_norm_path = f"{checkpoint_path}_vecnorm.pkl"
                         if os.path.exists(vec_norm_path):
                             try:
@@ -506,7 +208,7 @@ def resume_processor(resume, phase, start_phase, total_phases, model, model_para
                                 env = VecNormalize.load(vec_norm_path, env)
                                 print(f"已加载环境归一化状态: {vec_norm_path}")
                             except Exception as e:
-                                print(f"加载环境归一化状态失败: {e}")
+                                print(f"加载环境归一化状态失败，但继续训练: {e}")
                     else:
                         print(f"警告：未找到阶段{phase_set}的任何模型，使用新初始化的模型")
 
@@ -519,12 +221,11 @@ def resume_processor(resume, phase, start_phase, total_phases, model, model_para
                     except Exception as e:
                         print(f"加载回放经验池失败: {e}")
             else:
-                # 正常情况下尝试加载当前阶段的模型
+                # 正常情况下按新的优先级尝试加载当前阶段的模型
                 model_loaded = False
                 for path_name, path in [
-                    ("最新模型", latest_path),
-                    ("最佳模型", best_path),
-                    ("完成模型", phase_path)
+                    ("完成模型", phase_path),
+                    ("最佳模型", best_path)
                 ]:
                     if os.path.exists(f"{path}.zip"):
                         print(f"恢复训练：加载阶段{phase}的{path_name}")
@@ -564,7 +265,7 @@ def resume_processor(resume, phase, start_phase, total_phases, model, model_para
                             actual_lr = model.policy.optimizer.param_groups[0]['lr']
                             print(f"Actor优化器的实际学习率: {actual_lr}")
 
-                        # 尝试加载对应的环境归一化状态
+                        # 尝试加载对应的环境归一化状态，但不强制要求
                         vec_norm_path = f"{path}_vecnorm.pkl"
                         if os.path.exists(vec_norm_path):
                             try:
@@ -572,7 +273,7 @@ def resume_processor(resume, phase, start_phase, total_phases, model, model_para
                                 env = VecNormalize.load(vec_norm_path, env)
                                 print(f"已加载环境归一化状态: {vec_norm_path}")
                             except Exception as e:
-                                print(f"加载环境归一化状态失败: {e}")
+                                print(f"加载环境归一化状态失败，但继续训练: {e}")
                         model_loaded = True
                         break
 
@@ -595,7 +296,7 @@ def resume_processor(resume, phase, start_phase, total_phases, model, model_para
                             model.learning_rate = model_params["learning_rate"]
                             print(f"已更新学习率为当前阶段设置: {model_params['learning_rate']}")
 
-                        # 尝试加载对应的环境归一化状态
+                        # 尝试加载对应的环境归一化状态，但不强制要求
                         vec_norm_path = f"{checkpoint_path}_vecnorm.pkl"
                         if os.path.exists(vec_norm_path):
                             try:
@@ -603,7 +304,7 @@ def resume_processor(resume, phase, start_phase, total_phases, model, model_para
                                 env = VecNormalize.load(vec_norm_path, env)
                                 print(f"已加载环境归一化状态: {vec_norm_path}")
                             except Exception as e:
-                                print(f"加载环境归一化状态失败: {e}")
+                                print(f"加载环境归一化状态失败，但继续训练: {e}")
                     else:
                         print(f"警告：未找到阶段{phase}的任何模型，使用新初始化的模型")
 
@@ -620,25 +321,37 @@ def resume_processor(resume, phase, start_phase, total_phases, model, model_para
         load_from_phase = phase_config.get("load_from_phase")
         if load_from_phase is not None:
             model_path = os.path.join(MODELS_DIR, f"{algorithm}_phase{load_from_phase}")
-            if os.path.exists(f"{model_path}.zip"):
-                print(f"从阶段{load_from_phase}加载模型")
-                model = type(model).load(model_path, env=env)
+            best_path = os.path.join(MODELS_DIR, f"best_model")
 
-                # 更新模型的学习率为当前阶段配置的学习率
-                if hasattr(model, "learning_rate"):
-                    model.learning_rate = model_params["learning_rate"]
-                    print(f"已更新学习率为当前阶段设置: {model_params['learning_rate']}")
+            # 按新的优先级尝试加载模型
+            model_loaded = False
+            for path_name, path in [
+                ("完成模型", model_path),
+                ("最佳模型", best_path)
+            ]:
+                if os.path.exists(f"{path}.zip"):
+                    print(f"从{path_name}加载")
+                    model = type(model).load(path, env=env)
 
-                # 尝试加载对应的经验回放池
-                buffer_path = os.path.join(MODELS_DIR, f"{algorithm}_phase{load_from_phase}_replay_buffer.pkl")
-                if os.path.exists(buffer_path) and hasattr(model, "replay_buffer"):
-                    try:
-                        model.load_replay_buffer(buffer_path)
-                        print(f"已加载阶段{load_from_phase}的回放经验池")
-                    except Exception as e:
-                        print(f"加载回放经验池失败: {e}")
-            else:
-                print(f"警告: 未找到阶段{load_from_phase}的模型，使用新初始化的模型")
+                    # 更新模型的学习率为当前阶段配置的学习率
+                    if hasattr(model, "learning_rate"):
+                        model.learning_rate = model_params["learning_rate"]
+                        print(f"已更新学习率为当前阶段设置: {model_params['learning_rate']}")
+
+                    # 尝试加载对应的经验回放池
+                    buffer_path = os.path.join(MODELS_DIR, f"{algorithm}_phase{load_from_phase}_replay_buffer.pkl")
+                    if os.path.exists(buffer_path) and hasattr(model, "replay_buffer"):
+                        try:
+                            model.load_replay_buffer(buffer_path)
+                            print(f"已加载阶段{load_from_phase}的回放经验池")
+                        except Exception as e:
+                            print(f"加载回放经验池失败: {e}")
+
+                    model_loaded = True
+                    break
+
+            if not model_loaded:
+                print(f"警告: 未找到阶段{load_from_phase}的模型或最佳模型，使用新初始化的模型")
 
 
 def train_with_curriculum(env_class, curriculum_config, resume=False, phase_set=None, verbose=False):
@@ -659,7 +372,7 @@ def train_with_curriculum(env_class, curriculum_config, resume=False, phase_set=
     total_phases = curriculum_config["total_phases"]
     base_timesteps_per_phase = curriculum_config["timesteps_per_phase"]
     eval_freq = curriculum_config["eval_freq"]
-
+    start_phase = 1
     # 初始化或加载训练状态
     if resume:
         state = load_training_state(algorithm, total_phases)
@@ -733,14 +446,20 @@ def train_with_curriculum(env_class, curriculum_config, resume=False, phase_set=
 
     # 逐阶段训练
     for phase in range(start_phase, total_phases + 1):
+
         phase_config = curriculum_config["phases"][phase]
+        seed = phase_config["seed"]
+        performance_thresholds = phase_config["performance_thresholds"]
+        step_thresholds = performance_thresholds["step_thresholds"]
         print(f"阶段{phase}: {phase_config['name']}...")
 
         # 创建训练环境
-        env = create_env_from_config(env_class, phase_config["env_config"], is_eval=False, verbose=verbose)
+        env = create_env_from_config(env_class, phase_config["env_config"],
+                                     is_eval=False, verbose=verbose, seed=seed)
 
         # 创建评估环境
-        eval_env = create_env_from_config(env_class, phase_config["env_config"], is_eval=True, verbose=verbose)
+        eval_env = create_env_from_config(env_class, phase_config["env_config"], is_eval=True, verbose=verbose,
+                                          seed=seed)
 
         # 获取当前阶段的模型参数
         model_params = phase_config["model_params"][algorithm]
@@ -748,11 +467,12 @@ def train_with_curriculum(env_class, curriculum_config, resume=False, phase_set=
             print(f"当前阶段{phase}, 当前学习率为:{model_params['learning_rate']}")
 
         # 创建模型
-        model = create_model_from_config(algorithm, env, model_params)
+        model = create_model_from_config(algorithm, env, model_params, seed)
         if verbose >= 2:
             print(f"当前阶段{phase}, 模型创建后的学习率为:{model.learning_rate}")
         # 处理模型加载逻辑
-        resume_processor(resume, phase, start_phase, total_phases, model, model_params, env, algorithm, phase_set, phase_config)
+        resume_processor(resume, phase, start_phase, total_phases, model, model_params, env, algorithm, phase_set,
+                         phase_config)
 
         # 初始化阶段训练参数
         base_steps = base_timesteps_per_phase
@@ -773,21 +493,23 @@ def train_with_curriculum(env_class, curriculum_config, resume=False, phase_set=
         log_path = os.path.join(LOGS_DIR, f"eval_phase{phase}.csv")
         best_model_path = os.path.join(MODELS_DIR, f"{algorithm}_phase{phase}_best")
         latest_model_path = os.path.join(MODELS_DIR, f"{algorithm}_phase{phase}_latest")
-
+        save_log_callback = SaveModelLogCallback(verbose=1)
         # 创建评估回调
         eval_callback = CurriculumEvalCallback(
             eval_env=eval_env,
             phase=phase,
-            reward_threshold=phase_config["reward_threshold"],
-            std_threshold_ratio=1.0,  # 标准差不超过平均值的20%
+            performance_thresholds=phase_config.get("performance_thresholds"),  # 添加性能阈值参数
+            callback_on_new_best=save_log_callback,
+            std_threshold_ratio=0.2,  # 标准差不超过平均值的20%
             n_eval_episodes=10,
-            early_stop_patience=10,
+            early_stop_patience=MAX_INT,
             eval_freq=eval_freq,
             log_path=log_path,
             best_model_save_path=best_model_path,
             deterministic=True,
             min_delta=1.0,
-            verbose=1
+            verbose=1,
+            check_direction=False,  # 启用方向检查
         )
 
         # 创建保存最新模型的回调
@@ -805,7 +527,6 @@ def train_with_curriculum(env_class, curriculum_config, resume=False, phase_set=
         checkpoint_callback = SaveCheckpointCallback(
             algorithm=algorithm,
             save_dir=checkpoint_dir,
-            save_freq=eval_freq * 5,
             max_checkpoints=5
         )
         all_callbacks.append(checkpoint_callback)
@@ -813,11 +534,20 @@ def train_with_curriculum(env_class, curriculum_config, resume=False, phase_set=
         learning_rate_callback = LinearLRDecayCallback(
             verbose=2,
             decay_start_step=0,  # 从第0步开始衰减
-            decay_end_step=500000,  # 到第90000步结束衰减
+            decay_end_step=200000,  # 到第90000步结束衰减
             final_lr_fraction=0.1  # 最终学习率为初始学习率的10%
         )
+        # 创建球位置分布回调
         all_callbacks.append(learning_rate_callback)
-
+        # 小球位置变化回调函数
+        # ball_position_callback = BallPositionCallback(eval_env)
+        # all_callbacks.append(ball_position_callback)
+        # 创建回调函数
+        reward_callback = RewardMetricsCallback(
+            verbose=1,  # 日志详细程度
+            log_freq=50,  # 每1000步记录一次数据
+        )
+        all_callbacks.append(reward_callback)
         # 计算剩余训练步数
         remaining_steps = total_timesteps
         if resume and phase == start_phase:
@@ -869,8 +599,7 @@ def train_with_curriculum(env_class, curriculum_config, resume=False, phase_set=
                 f"阶段{phase}未完成. 最佳平均奖励: {eval_callback.best_mean_reward:.2f}")
             # 如果当前阶段未完成，停止训练
             print(f"阶段{phase}未达到目标奖励阈值，停止训练")
-
-            break
+            pass
 
         # 保存训练状态
         save_training_state(
